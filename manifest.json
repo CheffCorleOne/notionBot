@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Notion — проверка контрагентов (КГД)",
+  "version": "1.0.0",
+  "description": "Массово определяет налоговый режим поставщиков по счетам из базы Notion через API КГД МФ РК.",
+  "permissions": ["storage", "activeTab", "tabs"],
+  "host_permissions": [
+    "https://api.notion.com/*",
+    "https://openrouter.ai/*",
+    "https://*.notion.so/*",
+    "https://portal.kgd.gov.kz/*",
+    "https://*.kgd.gov.kz/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Настройки проверки контрагентов",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.notion.so/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/pdf.min.mjs", "lib/pdf.worker.min.mjs"],
+      "matches": ["https://*.notion.so/*"]
+    }
+  ]
+}

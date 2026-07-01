@@ -1,0 +1,64 @@
+/* Плавающая кнопка + тост на странице Notion. Высокий z-index, свои стили. */
+
+#kgd-check-btn {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 2147483000;
+  padding: 12px 18px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  background: #2f6fed;
+  border: none;
+  border-radius: 10px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.05s ease;
+}
+
+#kgd-check-btn:hover {
+  background: #1f5ad0;
+}
+
+#kgd-check-btn:active {
+  transform: translateY(1px);
+}
+
+#kgd-check-btn:disabled,
+#kgd-check-btn.kgd-busy {
+  background: #9bb4e8;
+  cursor: default;
+}
+
+#kgd-check-toast {
+  position: fixed;
+  right: 24px;
+  bottom: 78px;
+  z-index: 2147483000;
+  max-width: 360px;
+  padding: 10px 14px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #1a1a1a;
+  background: #ffffff;
+  border: 1px solid #e2e2e2;
+  border-left: 4px solid #2f6fed;
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  display: none;
+}
+
+#kgd-check-toast.kgd-toast-ok {
+  border-left-color: #17a34a;
+}
+
+#kgd-check-toast.kgd-toast-err {
+  border-left-color: #dc2626;
+}
+
+#kgd-check-toast.kgd-toast-info {
+  border-left-color: #2f6fed;
+}

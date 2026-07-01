@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Настройки</title>
+    <style>
+      body {
+        width: 340px;
+        margin: 0;
+        padding: 14px 16px 18px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
+        color: #1a1a1a;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 10px;
+      }
+      label {
+        display: block;
+        margin: 10px 0 3px;
+        font-weight: 600;
+      }
+      .hint {
+        font-weight: 400;
+        color: #666;
+        font-size: 11px;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 7px 9px;
+        font-size: 13px;
+        border: 1px solid #d0d0d0;
+        border-radius: 6px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+      }
+      .row > div {
+        flex: 1;
+      }
+      button {
+        margin-top: 14px;
+        width: 100%;
+        padding: 9px;
+        font-size: 14px;
+        font-weight: 600;
+        color: #fff;
+        background: #2f6fed;
+        border: none;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #1f5ad0;
+      }
+      #status {
+        margin-top: 8px;
+        font-size: 12px;
+        min-height: 15px;
+      }
+      #status.ok {
+        color: #17a34a;
+      }
+      #status.err {
+        color: #dc2626;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Проверка контрагентов (КГД)</h1>
+
+    <label>Notion Integration Token</label>
+    <input id="notionToken" type="password" placeholder="secret_..." autocomplete="off" />
+
+    <label>ID базы данных Notion</label>
+    <input id="databaseId" type="text" placeholder="32 символа или UUID" autocomplete="off" />
+
+    <div class="row">
+      <div>
+        <label>Колонка с файлом</label>
+        <input id="fileColumn" type="text" placeholder="счета" />
+      </div>
+      <div>
+        <label>Колонка результата</label>
+        <input id="resultColumn" type="text" placeholder="Налоговый режим" />
+      </div>
+    </div>
+
+    <label>БИН/ИИН нашей компании <span class="hint">(покупатель, исключается)</span></label>
+    <input id="ownXin" type="text" placeholder="12 цифр" inputmode="numeric" autocomplete="off" />
+
+    <label>OpenRouter API Key</label>
+    <input id="openrouterKey" type="password" placeholder="sk-or-..." autocomplete="off" />
+
+    <label>Модель OpenRouter <span class="hint">(при сбое сработает запасная)</span></label>
+    <input id="openrouterModel" type="text" placeholder="anthropic/claude-haiku-4.5" />
+
+    <label>X-Portal-Token (КГД)</label>
+    <input id="portalToken" type="password" placeholder="токен от КГД МФ РК" autocomplete="off" />
+
+    <label>Хост портала КГД <span class="hint">(по умолчанию)</span></label>
+    <input id="portalHost" type="text" placeholder="https://portal.kgd.gov.kz" />
+
+    <button id="save">Сохранить</button>
+    <div id="status"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
