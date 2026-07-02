@@ -14,7 +14,7 @@ const RATE_LIMIT_MS = 400;
 
 // Значения по умолчанию для настроек.
 const DEFAULTS = {
-  fileColumn: "счета",
+  fileColumn: "Счет",
   resultColumn: "Налоговый режим",
   openrouterModel: "anthropic/claude-haiku-4.5",
   portalHost: "https://portal.kgd.gov.kz",
