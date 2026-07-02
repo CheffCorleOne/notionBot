@@ -8,6 +8,7 @@
     "https://api.notion.com/*",
     "https://openrouter.ai/*",
     "https://*.notion.so/*",
+    "https://*.notion.com/*",
     "https://portal.kgd.gov.kz/*",
     "https://*.kgd.gov.kz/*"
   ],
@@ -31,7 +32,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://*.notion.so/*"],
+      "matches": ["https://*.notion.so/*", "https://*.notion.com/*"],
       "js": ["content.js"],
       "css": ["styles.css"],
       "run_at": "document_idle"
@@ -40,7 +41,7 @@
   "web_accessible_resources": [
     {
       "resources": ["lib/pdf.min.mjs", "lib/pdf.worker.min.mjs"],
-      "matches": ["https://*.notion.so/*"]
+      "matches": ["https://*.notion.so/*", "https://*.notion.com/*"]
     }
   ]
 }
