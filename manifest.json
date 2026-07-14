@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Notion — проверка контрагентов (КГД)",
   "version": "1.0.0",
-  "description": "Массово определяет налоговый режим поставщиков по счетам из базы Notion через API КГД МФ РК.",
-  "permissions": ["storage", "activeTab", "tabs"],
+  "description": "Массово определяет налоговый режим и статус плательщика НДС по счетам из базы Notion через API КГД МФ РК.",
+  "permissions": ["storage", "activeTab", "tabs", "offscreen"],
   "host_permissions": [
     "https://api.notion.com/*",
     "https://openrouter.ai/*",

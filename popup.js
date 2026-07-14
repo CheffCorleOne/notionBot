@@ -5,6 +5,8 @@ const FIELDS = [
   "databaseId",
   "fileColumn",
   "resultColumn",
+  "vatColumn",
+  "recentRowsLimit",
   "ownXin",
   "openrouterKey",
   "openrouterModel",
@@ -13,8 +15,10 @@ const FIELDS = [
 ];
 
 const DEFAULTS = {
-  fileColumn: "счета",
+  fileColumn: "Счет",
   resultColumn: "Налоговый режим",
+  vatColumn: "Плательщик НДС",
+  recentRowsLimit: "50",
   openrouterModel: "anthropic/claude-haiku-4.5",
   portalHost: "https://portal.kgd.gov.kz",
 };
@@ -30,10 +34,13 @@ function setStatus(text, tone) {
 }
 
 async function load() {
-  const stored = await chrome.storage.local.get(FIELDS);
+  const stored = await chrome.storage.local.get([...FIELDS, "hideFloatingButton"]);
   for (const key of FIELDS) {
     const val = stored[key] ?? DEFAULTS[key] ?? "";
     if ($(key)) $(key).value = val;
+  }
+  if ($("hideFloatingButton")) {
+    $("hideFloatingButton").checked = stored.hideFloatingButton === true;
   }
 }
 
@@ -42,6 +49,7 @@ async function save() {
   for (const key of FIELDS) {
     data[key] = ($(key)?.value ?? "").trim();
   }
+  data.hideFloatingButton = $("hideFloatingButton")?.checked === true;
   await chrome.storage.local.set(data);
   setStatus("Сохранено ✓", "ok");
   setTimeout(() => setStatus("", ""), 2000);

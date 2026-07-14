@@ -68,6 +68,17 @@
       #status.err {
         color: #dc2626;
       }
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 12px;
+        font-weight: 600;
+      }
+      .checkbox-row input {
+        width: auto;
+        margin: 0;
+      }
     </style>
   </head>
   <body>
@@ -82,13 +93,19 @@
     <div class="row">
       <div>
         <label>Колонка с файлом</label>
-        <input id="fileColumn" type="text" placeholder="счета" />
+        <input id="fileColumn" type="text" placeholder="Счет" />
       </div>
       <div>
         <label>Колонка результата</label>
         <input id="resultColumn" type="text" placeholder="Налоговый режим" />
       </div>
     </div>
+
+    <label>Колонка статуса НДС</label>
+    <input id="vatColumn" type="text" placeholder="Плательщик НДС" />
+
+    <label>Последних строк за запуск <span class="hint">(по дате добавления)</span></label>
+    <input id="recentRowsLimit" type="number" min="1" max="1000" step="1" placeholder="50" inputmode="numeric" />
 
     <label>БИН/ИИН нашей компании <span class="hint">(покупатель, исключается)</span></label>
     <input id="ownXin" type="text" placeholder="12 цифр" inputmode="numeric" autocomplete="off" />
@@ -104,6 +121,11 @@
 
     <label>Хост портала КГД <span class="hint">(по умолчанию)</span></label>
     <input id="portalHost" type="text" placeholder="https://portal.kgd.gov.kz" />
+
+    <label class="checkbox-row">
+      <input id="hideFloatingButton" type="checkbox" />
+      Скрыть кнопку «Проверить контрагентов» на странице Notion
+    </label>
 
     <button id="save">Сохранить</button>
     <div id="status"></div>

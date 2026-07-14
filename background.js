@@ -1,13 +1,14 @@
 // Service worker (module). Вся логика и сетевые запросы живут здесь —
 // host_permissions на notion / openrouter / kgd избавляют от CORS в этом контексте.
 
-import * as pdfjsLib from "./lib/pdf.min.mjs";
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.mjs");
-
 const NOTION_VERSION = "2022-06-28";
 const NOTION_API = "https://api.notion.com/v1";
 const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
+const OFFSCREEN_DOCUMENT = "offscreen.html";
+const PDF_CHANNEL = "notionbot-pdf-text";
+const MAX_TEXT_CHARS = 12000;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const PDF_RENDER_TIMEOUT_MS = 45000;
 
 // Пауза между запросами к Notion (лимит ~3 req/sec).
 const RATE_LIMIT_MS = 400;
@@ -16,6 +17,8 @@ const RATE_LIMIT_MS = 400;
 const DEFAULTS = {
   fileColumn: "Счет",
   resultColumn: "Налоговый режим",
+  vatColumn: "Плательщик НДС",
+  recentRowsLimit: 50,
   openrouterModel: "anthropic/claude-haiku-4.5",
   portalHost: "https://portal.kgd.gov.kz",
 };
@@ -29,24 +32,77 @@ const FALLBACK_MODELS = [
   "openai/gpt-4o-mini",
 ];
 
+const VISION_FALLBACK_MODELS = [
+  "google/gemini-2.0-flash-001",
+  "openai/gpt-4o-mini",
+  "anthropic/claude-3.5-haiku",
+];
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let creatingOffscreenDocument = null;
+let pdfRequestCounter = 0;
+let keepAliveTimer = null;
+
+function startKeepAlive() {
+  stopKeepAlive();
+  keepAliveTimer = setInterval(() => {
+    chrome.runtime.getPlatformInfo(() => {});
+  }, 15000);
+}
+
+function stopKeepAlive() {
+  if (!keepAliveTimer) return;
+  clearInterval(keepAliveTimer);
+  keepAliveTimer = null;
+}
 
 // ---------------------------------------------------------------------------
 // Точка входа: сообщение от content.js по клику на плавающую кнопку.
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "START_CHECK") {
-    const tabId = sender.tab?.id;
-    runBatch(tabId)
-      .then((summary) => sendResponse({ ok: true, summary }))
-      .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
-    return true; // асинхронный ответ
+    (async () => {
+      let tabId;
+      try {
+        tabId = await resolveTabId(sender);
+        if (tabId == null) {
+          throw new Error("не удалось определить вкладку Notion");
+        }
+        startKeepAlive();
+        progress(tabId, { stage: "start", text: "Запуск..." });
+        await runBatch(tabId);
+      } catch (err) {
+        progress(tabId, { stage: "error", text: `Ошибка: ${String(err?.message || err)}` });
+      } finally {
+        stopKeepAlive();
+      }
+    })();
+    sendResponse({ ok: true, started: true });
+    return false;
   }
 });
+
+async function resolveTabId(sender) {
+  if (sender.tab?.id != null) return sender.tab.id;
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const notionTab = tabs.find((tab) => /notion\.(so|com)/.test(tab.url || ""));
+  return notionTab?.id ?? tabs[0]?.id;
+}
 
 function progress(tabId, payload) {
   if (tabId == null) return;
   chrome.tabs.sendMessage(tabId, { type: "PROGRESS", ...payload }).catch(() => {});
+}
+
+function makeReporter(tabId, base) {
+  return (text) => {
+    if (!text) return;
+    progress(tabId, { stage: "processing", text: base ? `${base}: ${text}` : text });
+  };
+}
+
+function visionModels(cfg) {
+  return dedupe([cfg.openrouterModel, ...VISION_FALLBACK_MODELS].filter(Boolean));
 }
 
 // ---------------------------------------------------------------------------
@@ -57,36 +113,47 @@ async function runBatch(tabId) {
 
   progress(tabId, { stage: "start", text: "Подготовка..." });
 
-  // Убедиться, что колонка результата существует (создать при необходимости).
-  await ensureResultColumn(cfg);
+  try {
+    await ensureOffscreenDocument();
+  } catch {
+    // pdf.js недоступен — продолжим, упадём позже при чтении PDF
+  }
 
-  // Собрать все подходящие строки (файл есть, результат пуст).
+  progress(tabId, { stage: "start", text: "Проверяю базу Notion..." });
+  await ensureResultColumns(cfg);
+
+  progress(tabId, { stage: "start", text: "Ищу необработанные счета..." });
   const pages = await queryPendingPages(cfg);
   const total = pages.length;
 
   if (total === 0) {
-    progress(tabId, { stage: "done", text: "Новых строк нет — всё уже обработано." });
+    progress(tabId, { stage: "done", text: `В последних ${cfg.recentRowsLimit} строках нет новых счетов для обработки.` });
     return { total: 0, done: 0, errors: 0 };
   }
+
+  progress(tabId, { stage: "start", text: `Найдено ${total} счетов, начинаю...` });
 
   let done = 0;
   let errors = 0;
 
   for (let i = 0; i < total; i++) {
     const page = pages[i];
-    progress(tabId, { stage: "processing", current: i + 1, total, text: `Обрабатываю ${i + 1}/${total}...` });
+    const rowLabel = `Обрабатываю ${i + 1}/${total}`;
+    progress(tabId, { stage: "processing", current: i + 1, total, text: `${rowLabel}...` });
 
-    let resultText;
+    let result;
     try {
-      resultText = await processPage(page, cfg);
+      result = await processPage(page, cfg, makeReporter(tabId, rowLabel));
     } catch (err) {
-      resultText = `Ошибка: ${String(err?.message || err)}`;
+      const error = `Ошибка: ${String(err?.message || err)}`;
+      result = { taxMode: error, vatStatus: error };
       errors++;
     }
 
-    // Записать результат (или текст ошибки) в Notion. Не роняем весь процесс.
+    progress(tabId, { stage: "processing", current: i + 1, total, text: `${rowLabel}: записываю в Notion...` });
+
     try {
-      await writeResult(page.id, cfg, resultText);
+      await writeResult(page, cfg, result);
     } catch (err) {
       errors++;
     }
@@ -100,24 +167,45 @@ async function runBatch(tabId) {
 }
 
 // ---------------------------------------------------------------------------
-// Обработка одной строки: PDF → текст → БИН поставщика → КГД → строка результата.
+// Обработка одной строки: вложения → текст/vision → БИН поставщика → КГД → результаты.
 // ---------------------------------------------------------------------------
-async function processPage(page, cfg) {
-  const fileUrl = extractFileUrl(page, cfg.fileColumn);
-  if (!fileUrl) return "Ошибка: файл счёта не найден в колонке";
+async function processPage(page, cfg, report) {
+  const files = extractFiles(page, cfg.fileColumn);
+  if (!files.length) return errorResult("Ошибка: файл счёта не найден в колонке");
 
-  const pdfBytes = await downloadPdf(fileUrl);
-  const text = await extractPdfText(pdfBytes);
-  if (!text || text.trim().length < 10) return "Ошибка: не удалось распознать текст PDF";
+  let lastProblem = "";
+  for (const file of files) {
+    let attachment;
+    try {
+      report?.("скачиваю файл");
+      attachment = await downloadAttachment(file);
+      const { xin, confidence, note } = await extractSupplierXinFromAttachment(attachment, cfg, report);
+      if (!xin) {
+        lastProblem = note
+          ? `БИН поставщика не найден (${attachment.name}): ${note}`
+          : `БИН поставщика не найден (${attachment.name})`;
+        continue;
+      }
 
-  const { xin, confidence } = await extractSupplierXin(text, cfg);
-  if (!xin) return "Ошибка: БИН поставщика не найден";
+      report?.("запрос в КГД");
+      const kgd = await fetchCounterpartyData(xin, cfg);
+      if (kgd.error) return errorResult(kgd.error);
 
-  const kgd = await fetchTaxMode(xin, cfg);
-  if (kgd.error) return kgd.error;
+      const confidenceNote = confidence && confidence !== "high" ? ` (уверенность: ${confidence})` : "";
+      return {
+        taxMode: `${kgd.taxMode}${confidenceNote}`,
+        vatStatus: `${kgd.vatStatus}${confidenceNote}`,
+      };
+    } catch (err) {
+      lastProblem = `${attachment?.name || file.name || "файл"}: ${String(err?.message || err)}`;
+    }
+  }
 
-  const note = confidence && confidence !== "high" ? ` (уверенность: ${confidence})` : "";
-  return `${kgd.taxMode}${note}`;
+  return errorResult(`Ошибка: ${lastProblem || "не удалось обработать прикреплённые файлы"}`);
+}
+
+function errorResult(message) {
+  return { taxMode: message, vatStatus: message };
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +225,7 @@ async function loadConfig() {
   }
   cfg.databaseId = normalizeId(cfg.databaseId);
   cfg.ownXin = onlyDigits(cfg.ownXin || "");
+  cfg.recentRowsLimit = parseRecentRowsLimit(cfg.recentRowsLimit);
   return cfg;
 }
 
@@ -151,6 +240,12 @@ function normalizeId(id) {
 
 const onlyDigits = (s) => String(s || "").replace(/\D/g, "");
 
+function parseRecentRowsLimit(value) {
+  const n = Number.parseInt(String(value ?? DEFAULTS.recentRowsLimit), 10);
+  if (!Number.isFinite(n)) return DEFAULTS.recentRowsLimit;
+  return Math.min(Math.max(n, 1), 1000);
+}
+
 // ---------------------------------------------------------------------------
 // Notion API
 // ---------------------------------------------------------------------------
@@ -162,7 +257,7 @@ function notionHeaders(cfg) {
   };
 }
 
-async function ensureResultColumn(cfg) {
+async function ensureResultColumns(cfg) {
   const res = await fetch(`${NOTION_API}/databases/${cfg.databaseId}`, {
     method: "GET",
     headers: notionHeaders(cfg),
@@ -176,31 +271,36 @@ async function ensureResultColumn(cfg) {
   if (!db.properties?.[cfg.fileColumn]) {
     throw new Error(`В базе нет колонки с файлом «${cfg.fileColumn}» — проверьте название в настройках`);
   }
-  if (db.properties?.[cfg.resultColumn]) return; // уже есть
+  if (cfg.resultColumn === cfg.vatColumn) {
+    throw new Error("Названия колонок налогового режима и НДС должны отличаться");
+  }
+
+  const properties = {};
+  if (!db.properties?.[cfg.resultColumn]) properties[cfg.resultColumn] = { rich_text: {} };
+  if (!db.properties?.[cfg.vatColumn]) properties[cfg.vatColumn] = { rich_text: {} };
+  if (!Object.keys(properties).length) return;
 
   const patch = await fetch(`${NOTION_API}/databases/${cfg.databaseId}`, {
     method: "PATCH",
     headers: notionHeaders(cfg),
-    body: JSON.stringify({ properties: { [cfg.resultColumn]: { rich_text: {} } } }),
+    body: JSON.stringify({ properties }),
   });
   if (!patch.ok) {
     const body = await safeText(patch);
-    throw new Error(`Notion: не удалось создать колонку «${cfg.resultColumn}» (${patch.status}). ${body}`);
+    throw new Error(`Notion: не удалось создать колонки результата (${patch.status}). ${body}`);
   }
 }
 
 async function queryPendingPages(cfg) {
-  const pages = [];
+  const recentPages = [];
   let cursor;
   do {
+    const remaining = cfg.recentRowsLimit - recentPages.length;
+    if (remaining <= 0) break;
+
     const body = {
-      page_size: 100,
-      filter: {
-        and: [
-          { property: cfg.fileColumn, files: { is_not_empty: true } },
-          { property: cfg.resultColumn, rich_text: { is_empty: true } },
-        ],
-      },
+      page_size: Math.min(100, remaining),
+      sorts: [{ timestamp: "created_time", direction: "descending" }],
     };
     if (cursor) body.start_cursor = cursor;
 
@@ -214,31 +314,93 @@ async function queryPendingPages(cfg) {
       throw new Error(`Notion: ошибка запроса строк (${res.status}). ${errText}`);
     }
     const data = await res.json();
-    pages.push(...(data.results || []));
-    cursor = data.has_more ? data.next_cursor : undefined;
+    recentPages.push(...(data.results || []));
+    cursor = data.has_more && recentPages.length < cfg.recentRowsLimit ? data.next_cursor : undefined;
     if (cursor) await sleep(RATE_LIMIT_MS);
   } while (cursor);
-  return pages;
+
+  return recentPages.filter((page) => {
+    const fileProp = page.properties?.[cfg.fileColumn];
+    const resultProp = page.properties?.[cfg.resultColumn];
+    const vatProp = page.properties?.[cfg.vatColumn];
+    return hasFiles(fileProp) && (isEmptyNotionProperty(resultProp) || isEmptyNotionProperty(vatProp));
+  });
 }
 
-function extractFileUrl(page, fileColumn) {
+function hasFiles(prop) {
+  return Array.isArray(prop?.files) && prop.files.length > 0;
+}
+
+function isEmptyNotionProperty(prop) {
+  if (!prop) return true;
+  switch (prop.type) {
+    case "rich_text":
+      return !prop.rich_text?.length;
+    case "title":
+      return !prop.title?.length;
+    case "files":
+      return !prop.files?.length;
+    case "multi_select":
+      return !prop.multi_select?.length;
+    case "select":
+      return !prop.select;
+    case "date":
+      return !prop.date;
+    case "number":
+      return prop.number == null;
+    case "email":
+      return !prop.email;
+    case "phone_number":
+      return !prop.phone_number;
+    case "url":
+      return !prop.url;
+    case "checkbox":
+      return prop.checkbox !== true;
+    default:
+      return false;
+  }
+}
+
+function extractFiles(page, fileColumn) {
   const prop = page.properties?.[fileColumn];
-  const file = prop?.files?.[0];
-  if (!file) return null;
-  // Notion-hosted (временная ссылка) либо внешняя ссылка.
-  return file.file?.url || file.external?.url || null;
+  if (!Array.isArray(prop?.files)) return [];
+
+  return prop.files
+    .map((file) => {
+      const url = file.file?.url || file.external?.url || null;
+      return {
+        name: file.name || filenameFromUrl(url) || "attachment",
+        url,
+      };
+    })
+    .filter((file) => file.url);
 }
 
-async function writeResult(pageId, cfg, text) {
-  const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+function filenameFromUrl(url) {
+  if (!url) return "";
+  try {
+    const pathname = new URL(url).pathname;
+    return decodeURIComponent(pathname.split("/").filter(Boolean).pop() || "");
+  } catch {
+    return "";
+  }
+}
+
+async function writeResult(page, cfg, result) {
+  const properties = {};
+  if (isEmptyNotionProperty(page.properties?.[cfg.resultColumn])) {
+    properties[cfg.resultColumn] = richTextValue(result.taxMode);
+  }
+  if (isEmptyNotionProperty(page.properties?.[cfg.vatColumn])) {
+    properties[cfg.vatColumn] = richTextValue(result.vatStatus);
+  }
+  if (!Object.keys(properties).length) return;
+
+  const res = await fetch(`${NOTION_API}/pages/${page.id}`, {
     method: "PATCH",
     headers: notionHeaders(cfg),
     body: JSON.stringify({
-      properties: {
-        [cfg.resultColumn]: {
-          rich_text: [{ type: "text", text: { content: String(text).slice(0, 1900) } }],
-        },
-      },
+      properties,
     }),
   });
   if (!res.ok) {
@@ -247,31 +409,608 @@ async function writeResult(pageId, cfg, text) {
   }
 }
 
+function richTextValue(text) {
+  return { rich_text: [{ type: "text", text: { content: String(text).slice(0, 1900) } }] };
+}
+
 // ---------------------------------------------------------------------------
-// PDF → текст (pdf.js). Без eval/remote-кода (isEvalSupported: false для MV3 CSP).
+// Вложения → текст. PDF.js работает в offscreen-документе, потому что в MV3
+// service worker нельзя использовать fallback PDF.js через dynamic import().
 // ---------------------------------------------------------------------------
-async function downloadPdf(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`не удалось скачать PDF (${res.status})`);
-  return new Uint8Array(await res.arrayBuffer());
+async function downloadAttachment(file) {
+  const res = await fetch(file.url);
+  if (!res.ok) throw new Error(`не удалось скачать файл (${res.status})`);
+
+  const contentType = normalizeContentType(res.headers.get("Content-Type"));
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const name = file.name || filenameFromUrl(file.url) || "attachment";
+  return {
+    ...file,
+    name,
+    bytes,
+    contentType,
+    ext: extensionFromName(name),
+  };
+}
+
+function normalizeContentType(contentType) {
+  return String(contentType || "").split(";")[0].trim().toLowerCase();
+}
+
+function extensionFromName(name) {
+  const clean = String(name || "").split("?")[0].split("#")[0];
+  const match = clean.match(/\.([a-z0-9]+)$/i);
+  return match ? match[1].toLowerCase() : "";
+}
+
+async function extractSupplierXinFromAttachment(attachment, cfg, report) {
+  const kind = detectAttachmentKind(attachment);
+
+  if (kind === "image") {
+    report?.("распознаю изображение (AI)");
+    return extractSupplierXinFromImage(attachment, cfg, report);
+  }
+
+  let text = "";
+  let localError = "";
+  try {
+    if (kind === "pdf") report?.("читаю PDF");
+    else report?.("извлекаю текст файла");
+    text = await extractAttachmentText(attachment, kind);
+  } catch (err) {
+    localError = String(err?.message || err);
+  }
+
+  if (isReadableText(text)) {
+    report?.("ищу БИН в тексте (AI)");
+    const result = await extractSupplierXin(text, cfg);
+    if (result.xin) return result;
+  }
+
+  if (canUseVisionFallback(kind, attachment)) {
+    report?.(kind === "pdf" ? "распознаю скан PDF (AI vision)" : "распознаю файл (AI vision)");
+    return extractSupplierXinViaVision(attachment, cfg, kind, report);
+  }
+
+  throw new Error(localError || "не удалось распознать текст файла");
+}
+
+function detectAttachmentKind(attachment) {
+  const bytes = attachment.bytes;
+  if (looksLikeImage(bytes)) return "image";
+  if (looksLikePdf(bytes)) return "pdf";
+  if (isImageAttachment(attachment)) return "image";
+  if (isPdfAttachment(attachment)) return "pdf";
+  if (isSpreadsheetAttachment(attachment)) return "spreadsheet";
+  if (isDocxAttachment(attachment)) return "docx";
+  if (isTextAttachment(attachment)) return "text";
+  if (attachment.ext === "xls") return "spreadsheet";
+  return "unknown";
+}
+
+function looksLikePdf(bytes) {
+  return (
+    bytes.length >= 5 &&
+    bytes[0] === 0x25 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x44 &&
+    bytes[3] === 0x46 &&
+    bytes[4] === 0x2d
+  );
+}
+
+function looksLikeImage(bytes) {
+  if (bytes.length < 4) return false;
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return true;
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return true;
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return true;
+  if (bytes[0] === 0x42 && bytes[1] === 0x4d) return true;
+  return (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  );
+}
+
+function isReadableText(text) {
+  const trimmed = String(text || "").trim();
+  if (trimmed.length < 10) return false;
+  const alnum = (trimmed.match(/[\p{L}\p{N}]/gu) || []).length;
+  return alnum / trimmed.length >= 0.2;
+}
+
+function canUseVisionFallback(kind, attachment) {
+  return kind === "pdf" || kind === "image" || looksLikePdf(attachment.bytes) || looksLikeImage(attachment.bytes);
+}
+
+async function extractAttachmentText(attachment, kind) {
+  const k = kind || detectAttachmentKind(attachment);
+  if (k === "pdf") return extractPdfText(attachment.bytes);
+  if (k === "spreadsheet") return extractSpreadsheetText(attachment);
+  if (k === "docx") return extractDocxText(attachment.bytes);
+  if (k === "text") return decodeTextBytes(attachment.bytes);
+
+  if (attachment.ext === "xls") {
+    const text = extractReadableBinaryStrings(attachment.bytes);
+    if (text.trim().length >= 10) return text;
+  }
+
+  throw new Error(`неподдерживаемый тип файла ${attachment.ext ? `.${attachment.ext}` : attachment.contentType || ""}`);
+}
+
+function isPdfAttachment({ contentType, ext }) {
+  return contentType === "application/pdf" || ext === "pdf";
+}
+
+function isImageAttachment({ contentType, ext }) {
+  return (
+    contentType.startsWith("image/") ||
+    ["jpg", "jpeg", "jfif", "png", "webp", "gif", "bmp", "tif", "tiff", "avif", "heic", "heif"].includes(ext)
+  );
+}
+
+function isSpreadsheetAttachment({ contentType, ext }) {
+  return (
+    ["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv"].includes(ext) ||
+    contentType.includes("spreadsheet") ||
+    contentType.includes("excel") ||
+    contentType === "text/csv" ||
+    contentType === "text/tab-separated-values"
+  );
+}
+
+function isDocxAttachment({ contentType, ext }) {
+  return ext === "docx" || contentType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+}
+
+function isTextAttachment({ contentType, ext }) {
+  return contentType.startsWith("text/") || ["txt", "csv", "tsv", "xml", "html", "htm"].includes(ext);
 }
 
 async function extractPdfText(bytes) {
-  const doc = await pdfjsLib.getDocument({
-    data: bytes,
-    isEvalSupported: false,
-    disableFontFace: true,
-    useSystemFonts: false,
-  }).promise;
+  await ensureOffscreenDocument();
 
-  let out = "";
-  for (let p = 1; p <= doc.numPages; p++) {
-    const page = await doc.getPage(p);
-    const content = await page.getTextContent();
-    out += content.items.map((it) => it.str).join(" ") + "\n";
+  const id = `pdf-${Date.now()}-${++pdfRequestCounter}`;
+  const channel = new BroadcastChannel(PDF_CHANNEL);
+  const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("PDF: тайм-аут извлечения текста"));
+    }, 120000);
+
+    function cleanup() {
+      clearTimeout(timeout);
+      channel.removeEventListener("message", onMessage);
+      channel.close();
+    }
+
+    function onMessage(event) {
+      const msg = event.data;
+      if (msg?.type !== "PDF_TEXT_RESULT" || msg.id !== id) return;
+
+      cleanup();
+      if (msg.ok) {
+        resolve(msg.text || "");
+      } else {
+        reject(new Error(msg.error || "PDF: не удалось извлечь текст"));
+      }
+    }
+
+    channel.addEventListener("message", onMessage);
+    channel.postMessage({ type: "EXTRACT_PDF_TEXT", id, buffer });
+  });
+}
+
+async function renderPdfToImages(bytes) {
+  await ensureOffscreenDocument();
+
+  const id = `pdf-img-${Date.now()}-${++pdfRequestCounter}`;
+  const channel = new BroadcastChannel(PDF_CHANNEL);
+  const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("PDF: тайм-аут рендера страниц"));
+    }, PDF_RENDER_TIMEOUT_MS);
+
+    function cleanup() {
+      clearTimeout(timeout);
+      channel.removeEventListener("message", onMessage);
+      channel.close();
+    }
+
+    function onMessage(event) {
+      const msg = event.data;
+      if (msg?.type !== "PDF_IMAGES_RESULT" || msg.id !== id) return;
+
+      cleanup();
+      if (msg.ok) {
+        resolve(Array.isArray(msg.images) ? msg.images : []);
+      } else {
+        reject(new Error(msg.error || "PDF: не удалось отрендерить страницы"));
+      }
+    }
+
+    channel.addEventListener("message", onMessage);
+    channel.postMessage({ type: "RENDER_PDF_TO_IMAGES", id, buffer });
+  });
+}
+
+async function extractSpreadsheetText(attachment) {
+  if (["csv", "tsv"].includes(attachment.ext) || attachment.contentType === "text/csv") {
+    return normalizeDelimitedText(decodeTextBytes(attachment.bytes), attachment.ext === "tsv" ? "\t" : ",");
   }
-  await doc.destroy();
-  return out;
+
+  if (["xlsx", "xlsm", "xltx", "xltm"].includes(attachment.ext) || attachment.contentType.includes("spreadsheet")) {
+    return extractXlsxText(attachment.bytes);
+  }
+
+  if (attachment.ext === "xls") {
+    return extractReadableBinaryStrings(attachment.bytes);
+  }
+
+  throw new Error(`неподдерживаемый формат таблицы .${attachment.ext || "unknown"}`);
+}
+
+function normalizeDelimitedText(text, delimiter) {
+  return text
+    .split(/\r?\n/)
+    .slice(0, 250)
+    .map((line) => line.split(delimiter).map((cell) => cell.trim()).filter(Boolean).join(" | "))
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, MAX_TEXT_CHARS);
+}
+
+async function extractDocxText(bytes) {
+  const entries = await readZipTextEntries(bytes, ["word/document.xml"]);
+  const xml = entries["word/document.xml"];
+  if (!xml) throw new Error("не удалось прочитать DOCX");
+
+  return extractXmlText(xml).slice(0, MAX_TEXT_CHARS);
+}
+
+async function extractXlsxText(bytes) {
+  const entries = await readZipTextEntries(bytes);
+  const sharedStrings = parseSharedStrings(entries["xl/sharedStrings.xml"] || "");
+  const sheetNames = parseWorkbookSheetNames(entries);
+  const sheetPaths = Object.keys(entries)
+    .filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(name))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+  if (!sheetPaths.length) throw new Error("не удалось найти листы XLSX");
+
+  const chunks = [];
+  for (let i = 0; i < sheetPaths.length; i++) {
+    const path = sheetPaths[i];
+    const sheetText = parseWorksheetText(entries[path], sharedStrings);
+    if (!sheetText) continue;
+    chunks.push(`Лист: ${sheetNames[path] || `sheet${i + 1}`}\n${sheetText}`);
+    if (chunks.join("\n\n").length >= MAX_TEXT_CHARS) break;
+  }
+
+  return chunks.join("\n\n").slice(0, MAX_TEXT_CHARS);
+}
+
+async function readZipTextEntries(bytes, wantedNames = null) {
+  const wanted = wantedNames ? new Set(wantedNames) : null;
+  const entries = {};
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const eocdOffset = findZipEndOfCentralDirectory(view);
+  if (eocdOffset < 0) throw new Error("некорректный ZIP/XLSX файл");
+
+  const totalEntries = view.getUint16(eocdOffset + 10, true);
+  let offset = view.getUint32(eocdOffset + 16, true);
+
+  for (let i = 0; i < totalEntries; i++) {
+    if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("некорректная структура ZIP");
+
+    const method = view.getUint16(offset + 10, true);
+    const compressedSize = view.getUint32(offset + 20, true);
+    const nameLength = view.getUint16(offset + 28, true);
+    const extraLength = view.getUint16(offset + 30, true);
+    const commentLength = view.getUint16(offset + 32, true);
+    const localHeaderOffset = view.getUint32(offset + 42, true);
+    const name = decodeUtf8(bytes.slice(offset + 46, offset + 46 + nameLength));
+
+    if (!wanted || wanted.has(name) || isUsefulOfficeXml(name)) {
+      const fileBytes = await readZipEntryBytes(bytes, localHeaderOffset, compressedSize, method);
+      entries[name] = decodeUtf8(fileBytes);
+    }
+
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+
+  return entries;
+}
+
+function isUsefulOfficeXml(name) {
+  return (
+    name === "xl/sharedStrings.xml" ||
+    name === "xl/workbook.xml" ||
+    name === "xl/_rels/workbook.xml.rels" ||
+    /^xl\/worksheets\/sheet\d+\.xml$/i.test(name) ||
+    name === "word/document.xml"
+  );
+}
+
+function findZipEndOfCentralDirectory(view) {
+  const min = Math.max(0, view.byteLength - 0xffff - 22);
+  for (let i = view.byteLength - 22; i >= min; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) return i;
+  }
+  return -1;
+}
+
+async function readZipEntryBytes(bytes, localHeaderOffset, compressedSize, method) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(localHeaderOffset, true) !== 0x04034b50) {
+    throw new Error("некорректный локальный ZIP-заголовок");
+  }
+
+  const nameLength = view.getUint16(localHeaderOffset + 26, true);
+  const extraLength = view.getUint16(localHeaderOffset + 28, true);
+  const dataStart = localHeaderOffset + 30 + nameLength + extraLength;
+  const compressed = bytes.slice(dataStart, dataStart + compressedSize);
+
+  if (method === 0) return compressed;
+  if (method === 8) return inflateRaw(compressed);
+  throw new Error(`неподдерживаемое сжатие ZIP (${method})`);
+}
+
+async function inflateRaw(bytes) {
+  if (typeof DecompressionStream !== "function") {
+    throw new Error("браузер не поддерживает распаковку XLSX");
+  }
+
+  const stream = new DecompressionStream("deflate-raw");
+  const writer = stream.writable.getWriter();
+  await writer.write(bytes);
+  await writer.close();
+  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+}
+
+function parseSharedStrings(xml) {
+  const strings = [];
+  for (const match of xml.matchAll(/<si\b[\s\S]*?<\/si>/g)) {
+    strings.push(extractXmlText(match[0]));
+  }
+  return strings;
+}
+
+function parseWorkbookSheetNames(entries) {
+  const workbookXml = entries["xl/workbook.xml"] || "";
+  const relsXml = entries["xl/_rels/workbook.xml.rels"] || "";
+  const rels = {};
+  const names = {};
+
+  for (const match of relsXml.matchAll(/<Relationship\b([^>]+)>/g)) {
+    const attrs = parseXmlAttributes(match[1]);
+    if (!attrs.Id || !attrs.Target) continue;
+    rels[attrs.Id] = normalizeWorkbookTarget(attrs.Target);
+  }
+
+  for (const match of workbookXml.matchAll(/<sheet\b([^>]+)>/g)) {
+    const attrs = parseXmlAttributes(match[1]);
+    const relId = attrs["r:id"] || attrs.id;
+    if (relId && rels[relId]) names[rels[relId]] = attrs.name || relId;
+  }
+
+  return names;
+}
+
+function normalizeWorkbookTarget(target) {
+  const clean = String(target || "").replace(/^\/+/, "");
+  if (clean.startsWith("xl/")) return clean;
+  if (clean.startsWith("worksheets/")) return `xl/${clean}`;
+  return `xl/${clean}`;
+}
+
+function parseWorksheetText(xml, sharedStrings) {
+  const rows = [];
+  for (const rowMatch of xml.matchAll(/<row\b[\s\S]*?<\/row>/g)) {
+    const cells = [];
+    for (const cellMatch of rowMatch[0].matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/g)) {
+      const attrs = parseXmlAttributes(cellMatch[1]);
+      const body = cellMatch[2];
+      let value = "";
+
+      if (attrs.t === "s") {
+        const index = Number.parseInt(extractXmlTagValue(body, "v"), 10);
+        value = Number.isFinite(index) ? sharedStrings[index] || "" : "";
+      } else if (attrs.t === "inlineStr") {
+        value = extractXmlText(body);
+      } else {
+        value = extractXmlTagValue(body, "v") || extractXmlText(body);
+      }
+
+      value = String(value).replace(/\s+/g, " ").trim();
+      if (value) cells.push(value);
+    }
+
+    if (cells.length) rows.push(cells.join(" | "));
+    if (rows.length >= 250) break;
+  }
+
+  return rows.join("\n");
+}
+
+function parseXmlAttributes(source) {
+  const attrs = {};
+  for (const match of String(source || "").matchAll(/([:\w-]+)=["']([^"']*)["']/g)) {
+    attrs[match[1]] = decodeXml(match[2]);
+  }
+  return attrs;
+}
+
+function extractXmlText(xml) {
+  const parts = [];
+  for (const match of String(xml || "").matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)) {
+    parts.push(decodeXml(match[1]));
+  }
+  if (parts.length) return parts.join(" ").replace(/\s+/g, " ").trim();
+  return decodeXml(String(xml || "").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+function extractXmlTagValue(xml, tagName) {
+  const match = String(xml || "").match(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`));
+  return match ? decodeXml(match[1]).trim() : "";
+}
+
+function decodeXml(text) {
+  return String(text || "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function decodeTextBytes(bytes) {
+  const utf8 = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  if (!utf8.includes("\uFFFD")) return utf8.slice(0, MAX_TEXT_CHARS);
+  return new TextDecoder("windows-1251", { fatal: false }).decode(bytes).slice(0, MAX_TEXT_CHARS);
+}
+
+function decodeUtf8(bytes) {
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+function extractReadableBinaryStrings(bytes) {
+  const asciiParts = [];
+  let ascii = "";
+
+  for (const byte of bytes) {
+    if (byte >= 32 && byte <= 126) {
+      ascii += String.fromCharCode(byte);
+    } else {
+      if (ascii.length >= 4) asciiParts.push(ascii);
+      ascii = "";
+    }
+  }
+  if (ascii.length >= 4) asciiParts.push(ascii);
+
+  const utf16Parts = [];
+  let utf16 = "";
+  for (let i = 0; i + 1 < bytes.length; i += 2) {
+    const code = bytes[i] | (bytes[i + 1] << 8);
+    if (isPrintableCodePoint(code)) {
+      utf16 += String.fromCharCode(code);
+    } else {
+      if (utf16.length >= 4) utf16Parts.push(utf16);
+      utf16 = "";
+    }
+  }
+  if (utf16.length >= 4) utf16Parts.push(utf16);
+
+  return dedupe([...utf16Parts, ...asciiParts])
+    .join("\n")
+    .slice(0, MAX_TEXT_CHARS);
+}
+
+function isPrintableCodePoint(code) {
+  return code === 9 || code === 10 || code === 13 || (code >= 32 && code <= 0x04ff);
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function mimeFromExtension(ext) {
+  switch (ext) {
+    case "jpg":
+    case "jpeg":
+    case "jfif":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "webp":
+      return "image/webp";
+    case "gif":
+      return "image/gif";
+    case "bmp":
+      return "image/bmp";
+    case "tif":
+    case "tiff":
+      return "image/tiff";
+    case "avif":
+      return "image/avif";
+    case "heic":
+      return "image/heic";
+    case "heif":
+      return "image/heif";
+    default:
+      return "";
+  }
+}
+
+async function ensureOffscreenDocument() {
+  if (!chrome.offscreen?.createDocument) {
+    throw new Error("PDF: текущий Chrome не поддерживает offscreen-документы");
+  }
+
+  const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT);
+  if ("getContexts" in chrome.runtime) {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [offscreenUrl],
+    });
+    if (contexts.length > 0) return;
+  } else {
+    const matchedClients = await self.clients.matchAll();
+    if (matchedClients.some((client) => client.url === offscreenUrl)) return;
+  }
+
+  if (!creatingOffscreenDocument) {
+    creatingOffscreenDocument = createOffscreenDocument();
+  }
+
+  try {
+    await creatingOffscreenDocument;
+  } finally {
+    creatingOffscreenDocument = null;
+  }
+}
+
+async function createOffscreenDocument() {
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_DOCUMENT,
+      reasons: ["WORKERS", "BLOBS"],
+      justification: "Parse locally downloaded PDF invoices with PDF.js.",
+    });
+  } catch (err) {
+    const message = String(err?.message || err);
+    if (message.includes("Only a single offscreen document")) return;
+    if (!message.includes("WORKERS") && !message.includes("reasons") && !message.includes("Value must be one of")) {
+      throw err;
+    }
+    try {
+      await chrome.offscreen.createDocument({
+        url: OFFSCREEN_DOCUMENT,
+        reasons: ["BLOBS"],
+        justification: "Parse locally downloaded PDF invoices with PDF.js.",
+      });
+    } catch (fallbackErr) {
+      if (!String(fallbackErr?.message || fallbackErr).includes("Only a single offscreen document")) {
+        throw fallbackErr;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -279,19 +1018,7 @@ async function extractPdfText(bytes) {
 // ---------------------------------------------------------------------------
 async function extractSupplierXin(invoiceText, cfg) {
   const models = dedupe([cfg.openrouterModel, ...FALLBACK_MODELS].filter(Boolean));
-
-  const excludeLine = cfg.ownXin
-    ? `БИН/ИИН НАШЕЙ компании (покупателя) — ${cfg.ownXin}. Никогда не возвращай именно этот номер.`
-    : `Если в счёте есть блок «Покупатель», его БИН/ИИН возвращать нельзя.`;
-
-  const prompt =
-    `Ниже текст счёта на оплату (Казахстан). Найди БИН или ИИН именно ПОСТАВЩИКА ` +
-    `(того, кто выставил счёт; обычно блок «Поставщик» / «Бенефициар»), а НЕ покупателя.\n` +
-    `${excludeLine}\n` +
-    `БИН/ИИН — это ровно 12 цифр.\n` +
-    `Ответь СТРОГО одним JSON-объектом без markdown и пояснений: ` +
-    `{"xin":"12 цифр или null","confidence":"high|medium|low"}.\n\n` +
-    `=== ТЕКСТ СЧЁТА ===\n${invoiceText.slice(0, 12000)}`;
+  const prompt = buildXinPrompt(`=== ТЕКСТ ФАЙЛА ===\n${invoiceText.slice(0, MAX_TEXT_CHARS)}`, cfg);
 
   let lastErr = "";
   for (const model of models) {
@@ -315,7 +1042,198 @@ async function extractSupplierXin(invoiceText, cfg) {
   return { xin: "", confidence: "low", note: lastErr };
 }
 
+async function extractSupplierXinViaVision(attachment, cfg, kind, report) {
+  if (kind === "pdf" || (looksLikePdf(attachment.bytes) && !looksLikeImage(attachment.bytes))) {
+    return extractSupplierXinFromPdfVision(attachment, cfg, report);
+  }
+  return extractSupplierXinFromImage(attachment, cfg, report);
+}
+
+async function extractSupplierXinFromImage(attachment, cfg, report) {
+  if (attachment.bytes.byteLength > MAX_IMAGE_BYTES) {
+    throw new Error(`изображение слишком большое (${Math.round(attachment.bytes.byteLength / 1024 / 1024)} МБ)`);
+  }
+
+  const models = visionModels(cfg);
+  const prompt = buildXinPrompt(
+    "Ниже прикреплено изображение счёта, скана, фото или табличного документа. Прочитай его визуально.",
+    cfg
+  );
+  const imageUrl = `data:${attachment.contentType || mimeFromExtension(attachment.ext) || "image/jpeg"};base64,${bytesToBase64(attachment.bytes)}`;
+
+  return tryModelsForXin(models, cfg, async (model) => {
+    report?.(`vision: ${shortModelName(model)}`);
+    return callOpenRouterMessages(
+      model,
+      [
+        { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+      cfg
+    );
+  });
+}
+
+function extractEmbeddedImagesFromPdf(bytes) {
+  const candidates = [];
+  let i = 0;
+
+  while (i < bytes.length - 3) {
+    if (bytes[i] === 0xff && bytes[i + 1] === 0xd8 && bytes[i + 2] === 0xff) {
+      let end = i + 3;
+      while (end < bytes.length - 1) {
+        if (bytes[end] === 0xff && bytes[end + 1] === 0xd9) {
+          end += 2;
+          break;
+        }
+        end++;
+      }
+      const slice = bytes.slice(i, end);
+      if (slice.length >= 5000) {
+        candidates.push({
+          size: slice.length,
+          url: `data:image/jpeg;base64,${bytesToBase64(slice)}`,
+        });
+      }
+      i = end;
+      continue;
+    }
+    i++;
+  }
+
+  return candidates
+    .sort((a, b) => b.size - a.size)
+    .slice(0, 3)
+    .map((item) => item.url);
+}
+
+async function extractSupplierXinFromPdfVision(attachment, cfg, report) {
+  if (attachment.bytes.byteLength > MAX_IMAGE_BYTES) {
+    throw new Error(`PDF слишком большой (${Math.round(attachment.bytes.byteLength / 1024 / 1024)} МБ)`);
+  }
+
+  let images = [];
+  let renderError = "";
+
+  try {
+    report?.("рендер страниц PDF");
+    images = await renderPdfToImages(attachment.bytes);
+  } catch (err) {
+    renderError = String(err?.message || err);
+  }
+
+  if (!images.length) {
+    report?.("извлекаю фото из PDF");
+    images = extractEmbeddedImagesFromPdf(attachment.bytes);
+  }
+
+  if (!images.length) {
+    return {
+      xin: "",
+      confidence: "low",
+      note: renderError || "не удалось получить изображение из PDF (проверьте lib/pdf.js в расширении)",
+    };
+  }
+
+  const rendered = await extractSupplierXinFromRenderedImages(images, cfg, report);
+  if (rendered.xin) return rendered;
+
+  return {
+    xin: "",
+    confidence: "low",
+    note: rendered.note || renderError || "БИН не найден",
+  };
+}
+
+async function extractSupplierXinFromRenderedImages(imageUrls, cfg, report) {
+  const models = visionModels(cfg);
+  const prompt = buildXinPrompt(
+    "Ниже страницы PDF счёта (возможно скан или фото). Прочитай документ визуально.",
+    cfg
+  );
+  const content = [{ type: "text", text: prompt }];
+  for (const url of imageUrls) {
+    content.push({ type: "image_url", image_url: { url } });
+  }
+
+  return tryModelsForXin(models, cfg, async (model) => {
+    report?.(`vision: ${shortModelName(model)}`);
+    return callOpenRouterMessages(
+      model,
+      [
+        { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
+        { role: "user", content },
+      ],
+      cfg
+    );
+  });
+}
+
+function shortModelName(model) {
+  const name = String(model || "");
+  const slash = name.lastIndexOf("/");
+  return slash >= 0 ? name.slice(slash + 1) : name;
+}
+
+async function tryModelsForXin(models, cfg, callModel) {
+  let lastErr = "";
+  for (const model of models) {
+    try {
+      const raw = await callModel(model);
+      const parsed = parseXinJson(raw);
+      if (parsed) {
+        let xin = onlyDigits(parsed.xin);
+        if (xin.length !== 12) xin = "";
+        if (xin && cfg.ownXin && xin === cfg.ownXin) xin = "";
+        if (xin) return { xin, confidence: parsed.confidence || "medium" };
+      }
+      lastErr = "модель вернула пустой/невалидный БИН";
+    } catch (err) {
+      const msg = String(err?.message || err);
+      if (msg.includes("HTTP 402") && msg.includes("files")) {
+        lastErr = "OpenRouter: для PDF-файлов нужен баланс, используем image vision";
+        continue;
+      }
+      lastErr = msg;
+    }
+  }
+  return { xin: "", confidence: "low", note: lastErr };
+}
+
+function buildXinPrompt(sourceText, cfg) {
+  const excludeLine = cfg.ownXin
+    ? `БИН/ИИН НАШЕЙ компании (покупателя) — ${cfg.ownXin}. Никогда не возвращай именно этот номер.`
+    : `Если в счёте есть блок «Покупатель», его БИН/ИИН возвращать нельзя.`;
+
+  return (
+    `Найди БИН или ИИН именно ПОСТАВЩИКА в счёте на оплату (Казахстан): ` +
+    `(того, кто выставил счёт; обычно блок «Поставщик» / «Бенефициар»), а НЕ покупателя.\n` +
+    `${excludeLine}\n` +
+    `БИН/ИИН — это ровно 12 цифр.\n` +
+    `Ответь СТРОГО одним JSON-объектом без markdown и пояснений: ` +
+    `{"xin":"12 цифр или null","confidence":"high|medium|low"}.\n\n` +
+    sourceText
+  );
+}
+
 async function callOpenRouter(model, prompt, cfg) {
+  return callOpenRouterMessages(
+    model,
+    [
+      { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
+      { role: "user", content: prompt },
+    ],
+    cfg
+  );
+}
+
+async function callOpenRouterMessages(model, messages, cfg, plugins) {
   const res = await fetch(OPENROUTER_API, {
     method: "POST",
     headers: {
@@ -327,10 +1245,8 @@ async function callOpenRouter(model, prompt, cfg) {
       model,
       temperature: 0,
       max_tokens: 100,
-      messages: [
-        { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
-        { role: "user", content: prompt },
-      ],
+      messages,
+      ...(plugins ? { plugins } : {}),
     }),
   });
   if (!res.ok) {
@@ -356,9 +1272,9 @@ function parseXinJson(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// API КГД МФ РК — получить налоговый режим (taxMode.ru).
+// API КГД МФ РК — "Сведения по контрагентам": налоговый режим и статус НДС.
 // ---------------------------------------------------------------------------
-async function fetchTaxMode(xin, cfg) {
+async function fetchCounterpartyData(xin, cfg) {
   const url = `${cfg.portalHost.replace(/\/+$/, "")}/services/isnaportal/public/get-sur-data`;
   let res;
   try {
@@ -371,8 +1287,8 @@ async function fetchTaxMode(xin, cfg) {
     return { error: `Ошибка: КГД недоступен (${String(err?.message || err)})` };
   }
 
-  if (res.status === 400) return { error: "Ошибка КГД 400: неверный запрос/БИН" };
-  if (res.status === 401) return { error: "Ошибка КГД 401: X-Portal-Token не авторизован" };
+  if (res.status === 400) return { error: "Ошибка КГД 400: запрос содержит синтаксическую ошибку" };
+  if (res.status === 401) return { error: "Ошибка КГД 401: пользователь не авторизован" };
   if (res.status === 404) return { error: "Ошибка КГД 404: доступ к сервису запрещён" };
   if (res.status === 500) return { error: "Ошибка КГД 500: сбой на сервере" };
   if (!res.ok) return { error: `Ошибка КГД ${res.status}` };
@@ -383,11 +1299,77 @@ async function fetchTaxMode(xin, cfg) {
   } catch {
     return { error: "Ошибка КГД: некорректный ответ (не JSON)" };
   }
-  const taxMode = data?.taxMode?.ru;
-  if (!taxMode || !String(taxMode).trim()) {
-    return { error: `Нет данных о налоговом режиме (БИН ${xin})` };
+
+  if (data?.status && data.status !== "SUCCESS") {
+    const apiError = formatKgdApiError(data.error);
+    return { error: `Ошибка КГД: ${apiError || data.status}` };
   }
-  return { taxMode: String(taxMode).trim() };
+  if (data?.error) {
+    return { error: `Ошибка КГД: ${formatKgdApiError(data.error) || "неизвестная ошибка"}` };
+  }
+
+  const payload = unwrapKgdPayload(data);
+  const taxMode = formatSurTaxMode(payload);
+  const vatStatus = formatVatStatus(payload);
+  const summary = summarizeKgdPayload(payload);
+  const suffix = `(БИН ${xin}${summary ? `; ${summary}` : ""})`;
+  return {
+    taxMode: taxMode || `Нет данных о налоговом режиме ${suffix}`,
+    vatStatus: vatStatus || `Нет данных о статусе НДС ${suffix}`,
+  };
+}
+
+function unwrapKgdPayload(data) {
+  if (!data || typeof data !== "object") return data;
+  return data.data || data.result || data.payload || data.response || data;
+}
+
+function formatSurTaxMode(data) {
+  if (!data || typeof data !== "object") return "";
+
+  const taxMode = localizeKgdValue(data.taxMode || data.taxRegime || data.taxModeName);
+  if (!taxMode) return "";
+
+  const taxModeDate = String(data.taxModeDate || data.taxRegimeDate || "").trim();
+  return taxModeDate ? `${taxMode} с ${taxModeDate}` : taxMode;
+}
+
+function formatVatStatus(data) {
+  if (!data || typeof data !== "object") return "";
+
+  const vatStatus = localizeKgdValue(data.vatInfo || data.vatStatus || data.vatPayer);
+  if (!vatStatus) return "";
+
+  const vatDate = String(data.vatDate || data.vatRegistrationDate || "").trim();
+  return vatDate ? `${vatStatus} с ${vatDate}` : vatStatus;
+}
+
+function localizeKgdValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number") return String(value).trim();
+  if (typeof value !== "object") return "";
+
+  const localized = value.ru || value.kk || value.en || value.qq || Object.values(value).find(Boolean);
+  return localized == null ? "" : String(localized).trim();
+}
+
+function summarizeKgdPayload(data) {
+  if (!data || typeof data !== "object") return "пустой ответ КГД";
+
+  const parts = [];
+  const name = localizeKgdValue(data.name);
+  if (name) parts.push(`контрагент: ${name}`);
+
+  const keys = Object.keys(data).slice(0, 12).join(", ");
+  if (keys) parts.push(`поля ответа: ${keys}`);
+
+  return parts.join("; ");
+}
+
+function formatKgdApiError(error) {
+  if (!error) return "";
+  if (typeof error === "string") return error;
+  return String(error.messageRu || error.message || error.description || JSON.stringify(error)).trim();
 }
 
 // ---------------------------------------------------------------------------

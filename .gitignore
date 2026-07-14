@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local agent/editor configuration
+.claude/
+AGENTS.md
+.vscode/
+.idea/
+
+# Generated archives and temporary output
+*.zip
+tmp/
+temp/
+output/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+

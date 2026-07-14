@@ -62,3 +62,7 @@
 #kgd-check-toast.kgd-toast-info {
   border-left-color: #2f6fed;
 }
+
+#kgd-check-toast.kgd-toast-error {
+  border-left-color: #dc2626;
+}
