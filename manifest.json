@@ -7,6 +7,7 @@
   "host_permissions": [
     "https://api.notion.com/*",
     "https://openrouter.ai/*",
+    "https://api.openai.com/*",
     "https://*.notion.so/*",
     "https://*.notion.com/*",
     "https://portal.kgd.gov.kz/*",

@@ -27,13 +27,17 @@
         color: #666;
         font-size: 11px;
       }
-      input {
+      input,
+      select {
         width: 100%;
         box-sizing: border-box;
         padding: 7px 9px;
         font-size: 13px;
         border: 1px solid #d0d0d0;
         border-radius: 6px;
+      }
+      select {
+        background: #fff;
       }
       .row {
         display: flex;
@@ -79,6 +83,10 @@
         width: auto;
         margin: 0;
       }
+      body.provider-is-openrouter .provider-openai,
+      body.provider-is-openai .provider-openrouter {
+        display: none;
+      }
     </style>
   </head>
   <body>
@@ -110,11 +118,27 @@
     <label>БИН/ИИН нашей компании <span class="hint">(покупатель, исключается)</span></label>
     <input id="ownXin" type="text" placeholder="12 цифр" inputmode="numeric" autocomplete="off" />
 
-    <label>OpenRouter API Key</label>
-    <input id="openrouterKey" type="password" placeholder="sk-or-..." autocomplete="off" />
+    <label>Провайдер AI <span class="hint">(для распознавания БИН)</span></label>
+    <select id="provider">
+      <option value="openrouter">OpenRouter (бесплатные модели)</option>
+      <option value="openai">OpenAI API (свой ключ, vision)</option>
+    </select>
 
-    <label>Модель OpenRouter <span class="hint">(при сбое сработает запасная)</span></label>
-    <input id="openrouterModel" type="text" placeholder="anthropic/claude-haiku-4.5" />
+    <div class="provider-openrouter">
+      <label>OpenRouter API Key</label>
+      <input id="openrouterKey" type="password" placeholder="sk-or-..." autocomplete="off" />
+
+      <label>Модель OpenRouter <span class="hint">(при сбое сработает запасная)</span></label>
+      <input id="openrouterModel" type="text" placeholder="anthropic/claude-haiku-4.5" />
+    </div>
+
+    <div class="provider-openai">
+      <label>OpenAI API Key</label>
+      <input id="openaiKey" type="password" placeholder="sk-..." autocomplete="off" />
+
+      <label>Модель OpenAI <span class="hint">(vision; при сбое сработает запасная)</span></label>
+      <input id="openaiModel" type="text" placeholder="gpt-4o-mini" />
+    </div>
 
     <label>X-Portal-Token (КГД)</label>
     <input id="portalToken" type="password" placeholder="токен от КГД МФ РК" autocomplete="off" />

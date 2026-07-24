@@ -8,8 +8,11 @@ const FIELDS = [
   "vatColumn",
   "recentRowsLimit",
   "ownXin",
+  "provider",
   "openrouterKey",
   "openrouterModel",
+  "openaiKey",
+  "openaiModel",
   "portalToken",
   "portalHost",
 ];
@@ -19,7 +22,9 @@ const DEFAULTS = {
   resultColumn: "Налоговый режим",
   vatColumn: "Плательщик НДС",
   recentRowsLimit: "50",
+  provider: "openrouter",
   openrouterModel: "anthropic/claude-haiku-4.5",
+  openaiModel: "gpt-4o-mini",
   portalHost: "https://portal.kgd.gov.kz",
 };
 
@@ -42,6 +47,14 @@ async function load() {
   if ($("hideFloatingButton")) {
     $("hideFloatingButton").checked = stored.hideFloatingButton === true;
   }
+  syncProviderVisibility();
+}
+
+// Показываем поля только выбранного провайдера (OpenRouter или OpenAI).
+function syncProviderVisibility() {
+  const provider = $("provider")?.value === "openai" ? "openai" : "openrouter";
+  document.body.classList.toggle("provider-is-openai", provider === "openai");
+  document.body.classList.toggle("provider-is-openrouter", provider === "openrouter");
 }
 
 async function save() {
@@ -58,4 +71,5 @@ async function save() {
 document.addEventListener("DOMContentLoaded", () => {
   load();
   $("save").addEventListener("click", save);
+  $("provider")?.addEventListener("change", syncProviderVisibility);
 });

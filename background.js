@@ -4,6 +4,7 @@
 const NOTION_VERSION = "2022-06-28";
 const NOTION_API = "https://api.notion.com/v1";
 const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
+const OPENAI_API = "https://api.openai.com/v1/chat/completions";
 const OFFSCREEN_DOCUMENT = "offscreen.html";
 const PDF_CHANNEL = "notionbot-pdf-text";
 const MAX_TEXT_CHARS = 12000;
@@ -19,7 +20,9 @@ const DEFAULTS = {
   resultColumn: "Налоговый режим",
   vatColumn: "Плательщик НДС",
   recentRowsLimit: 50,
+  provider: "openrouter",
   openrouterModel: "anthropic/claude-haiku-4.5",
+  openaiModel: "gpt-4o-mini",
   portalHost: "https://portal.kgd.gov.kz",
 };
 
@@ -37,6 +40,11 @@ const VISION_FALLBACK_MODELS = [
   "openai/gpt-4o-mini",
   "anthropic/claude-3.5-haiku",
 ];
+
+// Модели OpenAI (используются, если в настройках выбран провайдер OpenAI и указан
+// его API-ключ). Все они мультимодальные — умеют читать изображения (vision),
+// поэтому один список работает и для текста, и для сканов/фото.
+const OPENAI_FALLBACK_MODELS = ["gpt-4o-mini", "gpt-4o"];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let creatingOffscreenDocument = null;
@@ -101,7 +109,17 @@ function makeReporter(tabId, base) {
   };
 }
 
+function textModels(cfg) {
+  if (cfg.provider === "openai") {
+    return dedupe([cfg.openaiModel, ...OPENAI_FALLBACK_MODELS].filter(Boolean));
+  }
+  return dedupe([cfg.openrouterModel, ...FALLBACK_MODELS].filter(Boolean));
+}
+
 function visionModels(cfg) {
+  if (cfg.provider === "openai") {
+    return dedupe([cfg.openaiModel, ...OPENAI_FALLBACK_MODELS].filter(Boolean));
+  }
   return dedupe([cfg.openrouterModel, ...VISION_FALLBACK_MODELS].filter(Boolean));
 }
 
@@ -215,10 +233,16 @@ async function loadConfig() {
   const stored = await chrome.storage.local.get(null);
   const cfg = { ...DEFAULTS, ...stored };
 
+  cfg.provider = cfg.provider === "openai" ? "openai" : "openrouter";
+
   const missing = [];
   if (!cfg.notionToken) missing.push("Notion Integration Token");
   if (!cfg.databaseId) missing.push("ID базы данных Notion");
-  if (!cfg.openrouterKey) missing.push("OpenRouter API Key");
+  if (cfg.provider === "openai") {
+    if (!cfg.openaiKey) missing.push("OpenAI API Key");
+  } else if (!cfg.openrouterKey) {
+    missing.push("OpenRouter API Key");
+  }
   if (!cfg.portalToken) missing.push("X-Portal-Token (КГД)");
   if (missing.length) {
     throw new Error(`Заполните настройки: ${missing.join(", ")}`);
@@ -1017,7 +1041,7 @@ async function createOffscreenDocument() {
 // Извлечение БИН/ИИН ПОСТАВЩИКА через OpenRouter (с фолбэком по моделям).
 // ---------------------------------------------------------------------------
 async function extractSupplierXin(invoiceText, cfg) {
-  const models = dedupe([cfg.openrouterModel, ...FALLBACK_MODELS].filter(Boolean));
+  const models = textModels(cfg);
   const prompt = buildXinPrompt(`=== ТЕКСТ ФАЙЛА ===\n${invoiceText.slice(0, MAX_TEXT_CHARS)}`, cfg);
 
   let lastErr = "";
@@ -1063,7 +1087,7 @@ async function extractSupplierXinFromImage(attachment, cfg, report) {
 
   return tryModelsForXin(models, cfg, async (model) => {
     report?.(`vision: ${shortModelName(model)}`);
-    return callOpenRouterMessages(
+    return callChatMessages(
       model,
       [
         { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
@@ -1164,7 +1188,7 @@ async function extractSupplierXinFromRenderedImages(imageUrls, cfg, report) {
 
   return tryModelsForXin(models, cfg, async (model) => {
     report?.(`vision: ${shortModelName(model)}`);
-    return callOpenRouterMessages(
+    return callChatMessages(
       model,
       [
         { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
@@ -1223,7 +1247,7 @@ function buildXinPrompt(sourceText, cfg) {
 }
 
 async function callOpenRouter(model, prompt, cfg) {
-  return callOpenRouterMessages(
+  return callChatMessages(
     model,
     [
       { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
@@ -1231,6 +1255,40 @@ async function callOpenRouter(model, prompt, cfg) {
     ],
     cfg
   );
+}
+
+// Единая точка вызова чат-модели: маршрутизирует запрос в OpenAI или OpenRouter
+// в зависимости от выбранного в настройках провайдера. Формат сообщений (включая
+// image_url для vision) совместим у обоих API.
+async function callChatMessages(model, messages, cfg, plugins) {
+  if (cfg.provider === "openai") {
+    return callOpenAIMessages(model, messages, cfg);
+  }
+  return callOpenRouterMessages(model, messages, cfg, plugins);
+}
+
+async function callOpenAIMessages(model, messages, cfg) {
+  const res = await fetch(OPENAI_API, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.openaiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0,
+      max_tokens: 100,
+      messages,
+    }),
+  });
+  if (!res.ok) {
+    const body = await safeText(res);
+    throw new Error(`OpenAI ${model}: HTTP ${res.status} ${body.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content || !content.trim()) throw new Error(`OpenAI ${model}: пустой ответ`);
+  return content;
 }
 
 async function callOpenRouterMessages(model, messages, cfg, plugins) {
