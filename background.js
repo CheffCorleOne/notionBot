@@ -266,6 +266,19 @@ function normalizeId(id) {
 
 const onlyDigits = (s) => String(s || "").replace(/\D/g, "");
 
+// Проверка контрольного (12-го) разряда казахстанского БИН/ИИН.
+// Позволяет детерминированно отсеять номера, неверно распознанные моделью
+// со скана: при перепутанных цифрах контрольная сумма почти всегда не сходится.
+function isValidXinChecksum(xin) {
+  if (!/^\d{12}$/.test(xin)) return false;
+  const d = [...xin].map(Number);
+  const w1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+  const w2 = [3, 4, 5, 6, 7, 8, 9, 10, 11, 1, 2];
+  let s = d.slice(0, 11).reduce((acc, v, i) => acc + v * w1[i], 0) % 11;
+  if (s === 10) s = d.slice(0, 11).reduce((acc, v, i) => acc + v * w2[i], 0) % 11;
+  return s !== 10 && s === d[11];
+}
+
 function parseRecentRowsLimit(value) {
   const n = Number.parseInt(String(value ?? DEFAULTS.recentRowsLimit), 10);
   if (!Number.isFinite(n)) return DEFAULTS.recentRowsLimit;
@@ -1205,6 +1218,12 @@ async function tryModelsForXin(models, cfg, callModel) {
         let xin = onlyDigits(parsed.xin);
         if (xin.length !== 12) xin = "";
         if (xin && cfg.ownXin && xin === cfg.ownXin) xin = "";
+        if (xin && !isValidXinChecksum(xin)) {
+          // Контрольная цифра не сошлась — модель ошиблась при чтении
+          // (типично для сканов). Пробуем следующую модель цепочки.
+          errors.push(`${shortModelName(model)}: БИН ${xin} не прошёл контрольную сумму (ошибка распознавания скана)`);
+          continue;
+        }
         if (xin) return { xin, confidence: parsed.confidence || "medium" };
       }
       errors.push(`${shortModelName(model)}: пустой/невалидный БИН`);
@@ -1232,6 +1251,8 @@ function buildXinPrompt(sourceText, cfg) {
     `БИН/ИИН — это ровно 12 цифр. В документе цифры могут быть разделены пробелами ` +
     `или точками (например «721 027 300 595») — это тоже валидный БИН/ИИН, ` +
     `верни его как 12 цифр подряд без разделителей.\n` +
+    `Перепроверь каждую цифру: номер поставщика часто встречается в документе ` +
+    `несколько раз (реквизиты, блок «Поставщик», печать) — сверь эти вхождения между собой.\n` +
     `Ответь СТРОГО одним JSON-объектом без markdown и пояснений: ` +
     `{"xin":"12 цифр или null","confidence":"high|medium|low"}.\n\n` +
     sourceText
@@ -1326,36 +1347,56 @@ function parseXinJson(raw) {
 // ---------------------------------------------------------------------------
 async function fetchCounterpartyData(xin, cfg) {
   const url = `${cfg.portalHost.replace(/\/+$/, "")}/services/isnaportal/public/get-sur-data`;
+  // В каждой ошибке указываем отправленный БИН/ИИН: если модель неверно
+  // распознала номер со скана, это сразу видно при сравнении с документом.
+  const sent = `(отправлен БИН/ИИН ${xin})`;
+
+  // 500 и сетевые сбои бывают разовыми — пробуем до 3 раз с паузой.
+  const KGD_ATTEMPTS = 3;
   let res;
-  try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "X-Portal-Token": cfg.portalToken, "Content-Type": "application/json" },
-      body: JSON.stringify({ xin }),
-    });
-  } catch (err) {
-    return { error: `Ошибка: КГД недоступен (${String(err?.message || err)})` };
+  for (let attempt = 1; ; attempt++) {
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "X-Portal-Token": cfg.portalToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ xin }),
+      });
+    } catch (err) {
+      if (attempt < KGD_ATTEMPTS) {
+        await sleep(1000 * attempt);
+        continue;
+      }
+      return { error: `Ошибка: КГД недоступен (${String(err?.message || err)}) ${sent}` };
+    }
+    if (res.status === 500 && attempt < KGD_ATTEMPTS) {
+      await sleep(1000 * attempt);
+      continue;
+    }
+    break;
   }
 
-  if (res.status === 400) return { error: "Ошибка КГД 400: запрос содержит синтаксическую ошибку" };
-  if (res.status === 401) return { error: "Ошибка КГД 401: пользователь не авторизован" };
+  if (res.status === 400) return { error: `Ошибка КГД 400: запрос содержит синтаксическую ошибку ${sent}` };
+  if (res.status === 401) return { error: "Ошибка КГД 401: пользователь не авторизован (проверьте X-Portal-Token)" };
   if (res.status === 404) return { error: "Ошибка КГД 404: доступ к сервису запрещён" };
-  if (res.status === 500) return { error: "Ошибка КГД 500: сбой на сервере" };
-  if (!res.ok) return { error: `Ошибка КГД ${res.status}` };
+  if (res.status === 500)
+    return {
+      error: `Ошибка КГД 500: сбой на сервере ${sent}. Если номер не совпадает с документом — модель неверно распознала скан; если совпадает — сервис КГД не ответил, попробуйте позже`,
+    };
+  if (!res.ok) return { error: `Ошибка КГД ${res.status} ${sent}` };
 
   let data;
   try {
     data = await res.json();
   } catch {
-    return { error: "Ошибка КГД: некорректный ответ (не JSON)" };
+    return { error: `Ошибка КГД: некорректный ответ (не JSON) ${sent}` };
   }
 
   if (data?.status && data.status !== "SUCCESS") {
     const apiError = formatKgdApiError(data.error);
-    return { error: `Ошибка КГД: ${apiError || data.status}` };
+    return { error: `Ошибка КГД: ${apiError || data.status} ${sent}` };
   }
   if (data?.error) {
-    return { error: `Ошибка КГД: ${formatKgdApiError(data.error) || "неизвестная ошибка"}` };
+    return { error: `Ошибка КГД: ${formatKgdApiError(data.error) || "неизвестная ошибка"} ${sent}` };
   }
 
   const payload = unwrapKgdPayload(data);
