@@ -23,7 +23,7 @@ const DEFAULTS = {
   vatColumn: "Плательщик НДС",
   recentRowsLimit: "50",
   provider: "openrouter",
-  openrouterModel: "anthropic/claude-haiku-4.5",
+  openrouterModel: "google/gemma-4-31b-it:free",
   openaiModel: "gpt-4o-mini",
   portalHost: "https://portal.kgd.gov.kz",
 };

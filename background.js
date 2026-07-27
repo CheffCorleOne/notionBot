@@ -26,25 +26,22 @@ const DEFAULTS = {
   vatColumn: "Плательщик НДС",
   recentRowsLimit: 50,
   provider: "openrouter",
-  openrouterModel: "anthropic/claude-haiku-4.5",
+  openrouterModel: "google/gemma-4-31b-it:free",
   openaiModel: "gpt-4o-mini",
   portalHost: "https://portal.kgd.gov.kz",
 };
 
-// Цепочка запасных моделей OpenRouter. Если основная модель не отвечает
-// (сеть / не-200 / пустой или невалидный ответ) — пробуем следующую рабочую.
+// Цепочка запасных моделей OpenRouter — только бесплатные (все с vision).
+// Если основная модель не отвечает (сеть / не-200 / пустой или невалидный
+// ответ) — пробуем следующую. Модель из настроек всегда идёт первой; если она
+// совпадает с одной из цепочки, дубль убирается (dedupe в textModels/visionModels).
 const FALLBACK_MODELS = [
-  "anthropic/claude-haiku-4.5",
-  "anthropic/claude-3.5-haiku",
-  "google/gemini-2.0-flash-001",
-  "openai/gpt-4o-mini",
+  "google/gemma-4-31b-it:free",
+  "google/gemma-4-26b-a4b-it:free",
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
 ];
 
-const VISION_FALLBACK_MODELS = [
-  "google/gemini-2.0-flash-001",
-  "openai/gpt-4o-mini",
-  "anthropic/claude-3.5-haiku",
-];
+const VISION_FALLBACK_MODELS = FALLBACK_MODELS;
 
 // Модели OpenAI (используются, если в настройках выбран провайдер OpenAI и указан
 // его API-ключ). Все они мультимодальные — умеют читать изображения (vision),
@@ -1054,27 +1051,7 @@ async function createOffscreenDocument() {
 async function extractSupplierXin(invoiceText, cfg) {
   const models = textModels(cfg);
   const prompt = buildXinPrompt(`=== ТЕКСТ ФАЙЛА ===\n${invoiceText.slice(0, MAX_TEXT_CHARS)}`, cfg);
-
-  let lastErr = "";
-  for (const model of models) {
-    try {
-      const raw = await callOpenRouter(model, prompt, cfg);
-      const parsed = parseXinJson(raw);
-      if (parsed) {
-        // Валидируем и защищаемся от возврата нашего же БИН.
-        let xin = onlyDigits(parsed.xin);
-        if (xin.length !== 12) xin = "";
-        if (xin && cfg.ownXin && xin === cfg.ownXin) xin = "";
-        if (xin) return { xin, confidence: parsed.confidence || "medium" };
-      }
-      lastErr = "модель вернула пустой/невалидный БИН";
-    } catch (err) {
-      lastErr = String(err?.message || err);
-      // пробуем следующую модель
-    }
-  }
-  // Все модели исчерпаны.
-  return { xin: "", confidence: "low", note: lastErr };
+  return tryModelsForXin(models, cfg, (model) => callOpenRouter(model, prompt, cfg));
 }
 
 async function extractSupplierXinViaVision(attachment, cfg, kind, report) {
@@ -1217,7 +1194,9 @@ function shortModelName(model) {
 }
 
 async function tryModelsForXin(models, cfg, callModel) {
-  let lastErr = "";
+  // Собираем ошибку каждой модели, чтобы в Notion было видно, что именно
+  // произошло по всей цепочке, а не только у последней модели.
+  const errors = [];
   for (const model of models) {
     try {
       const raw = await callModel(model);
@@ -1228,17 +1207,17 @@ async function tryModelsForXin(models, cfg, callModel) {
         if (xin && cfg.ownXin && xin === cfg.ownXin) xin = "";
         if (xin) return { xin, confidence: parsed.confidence || "medium" };
       }
-      lastErr = "модель вернула пустой/невалидный БИН";
+      errors.push(`${shortModelName(model)}: пустой/невалидный БИН`);
     } catch (err) {
       const msg = String(err?.message || err);
       if (msg.includes("HTTP 402") && msg.includes("files")) {
-        lastErr = "OpenRouter: для PDF-файлов нужен баланс, используем image vision";
+        errors.push(`${shortModelName(model)}: для PDF-файлов нужен баланс`);
         continue;
       }
-      lastErr = msg;
+      errors.push(`${shortModelName(model)}: ${msg.slice(0, 160)}`);
     }
   }
-  return { xin: "", confidence: "low", note: lastErr };
+  return { xin: "", confidence: "low", note: errors.join("; ") };
 }
 
 function buildXinPrompt(sourceText, cfg) {
@@ -1250,7 +1229,9 @@ function buildXinPrompt(sourceText, cfg) {
     `Найди БИН или ИИН именно ПОСТАВЩИКА в счёте на оплату (Казахстан): ` +
     `(того, кто выставил счёт; обычно блок «Поставщик» / «Бенефициар»), а НЕ покупателя.\n` +
     `${excludeLine}\n` +
-    `БИН/ИИН — это ровно 12 цифр.\n` +
+    `БИН/ИИН — это ровно 12 цифр. В документе цифры могут быть разделены пробелами ` +
+    `или точками (например «721 027 300 595») — это тоже валидный БИН/ИИН, ` +
+    `верни его как 12 цифр подряд без разделителей.\n` +
     `Ответь СТРОГО одним JSON-объектом без markdown и пояснений: ` +
     `{"xin":"12 цифр или null","confidence":"high|medium|low"}.\n\n` +
     sourceText
