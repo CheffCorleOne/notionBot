@@ -14,6 +14,11 @@ const PDF_RENDER_TIMEOUT_MS = 45000;
 // Пауза между запросами к Notion (лимит ~3 req/sec).
 const RATE_LIMIT_MS = 400;
 
+// «Последние N строк» отсчитываются так же, как их видит пользователь в таблице:
+// view отсортирован по этой колонке по убыванию, берём верхние N строк.
+const SORT_COLUMN = "Дата оплаты";
+const SORT_DIRECTION = "descending";
+
 // Значения по умолчанию для настроек.
 const DEFAULTS = {
   fileColumn: "Счет",
@@ -324,7 +329,7 @@ async function queryPendingPages(cfg) {
 
     const body = {
       page_size: Math.min(100, remaining),
-      sorts: [{ timestamp: "created_time", direction: "descending" }],
+      sorts: [{ property: SORT_COLUMN, direction: SORT_DIRECTION }],
     };
     if (cursor) body.start_cursor = cursor;
 
@@ -335,6 +340,12 @@ async function queryPendingPages(cfg) {
     });
     if (!res.ok) {
       const errText = await safeText(res);
+      if (res.status === 400 && errText.includes(SORT_COLUMN)) {
+        throw new Error(
+          `Notion: в базе нет колонки «${SORT_COLUMN}», по которой сортируются строки. ` +
+            `Переименуйте колонку с датой оплаты в «${SORT_COLUMN}» или измените SORT_COLUMN в background.js.`
+        );
+      }
       throw new Error(`Notion: ошибка запроса строк (${res.status}). ${errText}`);
     }
     const data = await res.json();
