@@ -9,6 +9,12 @@ const OFFSCREEN_DOCUMENT = "offscreen.html";
 const PDF_CHANNEL = "notionbot-pdf-text";
 const MAX_TEXT_CHARS = 12000;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+// Лимит OpenAI на PDF-вложения — 32 МБ / 100 страниц на запрос; base64 добавляет ~33%.
+const MAX_PDF_BYTES = 20 * 1024 * 1024;
+// Мельче — логотипы и печати, а не страница-скан.
+const MIN_SCAN_PIXELS = 500000;
+// Больше не имеет смысла: vision-модели всё равно ужимают вход (~2048 px).
+const MAX_JPEG_DIMENSION = 2200;
 const PDF_RENDER_TIMEOUT_MS = 45000;
 
 // Пауза между запросами к Notion (лимит ~3 req/sec).
@@ -818,10 +824,14 @@ async function inflateRaw(bytes) {
   }
 
   const stream = new DecompressionStream("deflate-raw");
+  // Чтение результата должно начаться ДО записи: DecompressionStream
+  // останавливается на бэкпрешере (~16 КБ вывода), и «сначала дописать,
+  // потом читать» зависает навсегда на любом файле крупнее этого буфера.
+  const output = new Response(stream.readable).arrayBuffer();
   const writer = stream.writable.getWriter();
-  await writer.write(bytes);
-  await writer.close();
-  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+  writer.write(bytes).catch(() => {});
+  writer.close().catch(() => {});
+  return new Uint8Array(await output);
 }
 
 function parseSharedStrings(xml) {
@@ -1069,9 +1079,65 @@ async function extractSupplierXin(invoiceText, cfg) {
 
 async function extractSupplierXinViaVision(attachment, cfg, kind, report) {
   if (kind === "pdf" || (looksLikePdf(attachment.bytes) && !looksLikeImage(attachment.bytes))) {
-    return extractSupplierXinFromPdfVision(attachment, cfg, report);
+    // Сначала достаём встроенный скан из объектов PDF сами: модель получает
+    // картинку в полном разрешении плюс увеличенный верх страницы с реквизитами.
+    // Это читается заметно точнее, чем PDF целиком (OpenAI растеризует его сам
+    // в меньшем разрешении, и цифры БИН на сканах плывут).
+    let scanNote = "";
+    try {
+      report?.("достаю скан из PDF");
+      const scans = await extractScanImagesFromPdf(attachment.bytes);
+      if (scans.length) {
+        const result = await extractSupplierXinFromRenderedImages(scans, cfg, report);
+        if (result.xin) return result;
+        scanNote = result.note || "";
+      }
+    } catch (err) {
+      scanNote = String(err?.message || err);
+    }
+
+    // Скан не достался или БИН по нему не подтвердился — запасные пути:
+    // OpenAI умеет читать PDF-файл целиком, OpenRouter — только рендер страниц.
+    const fallback = cfg.provider === "openai"
+      ? await extractSupplierXinFromPdfFile(attachment, cfg, report)
+      : await extractSupplierXinFromPdfVision(attachment, cfg, report);
+    if (!fallback.xin && scanNote) {
+      fallback.note = [scanNote, fallback.note].filter(Boolean).join("; ");
+    }
+    return fallback;
   }
   return extractSupplierXinFromImage(attachment, cfg, report);
+}
+
+// Прямая отправка PDF в OpenAI: тип содержимого file с data:-URL, модель сама
+// читает и текстовый слой, и сканы (лимит OpenAI — 100 страниц / 32 МБ).
+async function extractSupplierXinFromPdfFile(attachment, cfg, report) {
+  if (attachment.bytes.byteLength > MAX_PDF_BYTES) {
+    throw new Error(`PDF слишком большой (${Math.round(attachment.bytes.byteLength / 1024 / 1024)} МБ)`);
+  }
+
+  const models = visionModels(cfg);
+  const prompt = buildXinPrompt("Ниже приложен PDF-файл счёта (возможно скан или фото). Прочитай его.", cfg);
+  const fileData = `data:application/pdf;base64,${bytesToBase64(attachment.bytes)}`;
+  const filename = /\.pdf$/i.test(attachment.name || "") ? attachment.name : "invoice.pdf";
+
+  return tryModelsForXin(models, cfg, async (model) => {
+    report?.(`PDF в модель: ${shortModelName(model)}`);
+    return callChatMessages(
+      model,
+      [
+        { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "file", file: { filename, file_data: fileData } },
+          ],
+        },
+      ],
+      cfg
+    );
+  });
 }
 
 async function extractSupplierXinFromImage(attachment, cfg, report) {
@@ -1096,13 +1162,246 @@ async function extractSupplierXinFromImage(attachment, cfg, report) {
           role: "user",
           content: [
             { type: "text", text: prompt },
-            { type: "image_url", image_url: { url: imageUrl } },
+            { type: "image_url", image_url: { url: imageUrl, detail: "high" } },
           ],
         },
       ],
       cfg
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// Извлечение скан-изображений напрямую из объектов PDF (без pdf.js).
+// Скан-приложения кладут страницу одним XObject /Image: DCTDecode (готовый
+// JPEG) или FlateDecode (сырой битмап 8 бит, Gray/RGB, иногда PNG-предикторы).
+// pdf.js на части таких файлов навсегда зависает в page.render(), поэтому
+// разбираем структуру PDF сами. Для каждой страницы-скана отдаём две картинки:
+// вся страница + увеличенный верх (там реквизиты и блок «Поставщик»).
+// ---------------------------------------------------------------------------
+async function extractScanImagesFromPdf(bytes) {
+  const latin = new TextDecoder("latin1").decode(bytes);
+  const urls = [];
+  const re = /\/Subtype\s*\/Image/g;
+  let match;
+  let attempts = 0;
+  while (urls.length < 4 && attempts < 20 && (match = re.exec(latin))) {
+    attempts++;
+    try {
+      const pageUrls = await decodePdfImageObject(bytes, latin, match.index);
+      if (pageUrls) urls.push(...pageUrls);
+    } catch {
+      // объект не разобрался — пробуем следующий
+    }
+  }
+  return urls.slice(0, 4);
+}
+
+async function decodePdfImageObject(bytes, latin, subtypeAt) {
+  const objAt = latin.lastIndexOf("obj", subtypeAt);
+  const streamAt = latin.indexOf("stream", subtypeAt);
+  if (objAt < 0 || streamAt < 0) return null;
+  const dict = latin.slice(objAt, streamAt);
+
+  const width = Number(dict.match(/\/Width\s+(\d+)/)?.[1]);
+  const height = Number(dict.match(/\/Height\s+(\d+)/)?.[1]);
+  if (!width || !height || width * height < MIN_SCAN_PIXELS) return null;
+
+  const filter = dict.match(/\/Filter\s*\[?\s*\/(\w+)/)?.[1] || "";
+  let dataStart = streamAt + 6;
+  if (bytes[dataStart] === 0x0d) dataStart++;
+  if (bytes[dataStart] === 0x0a) dataStart++;
+  const dataEnd = pdfStreamEnd(latin, dict, dataStart);
+  if (dataEnd <= dataStart || dataEnd > bytes.length) return null;
+  const data = bytes.slice(dataStart, dataEnd);
+
+  if (filter === "DCTDecode") {
+    const bitmap = await createImageBitmap(new Blob([data], { type: "image/jpeg" }));
+    try {
+      if (bitmap.width * bitmap.height < MIN_SCAN_PIXELS) return null;
+      return await bitmapSourceToJpegUrls(bitmap, bitmap.width, bitmap.height);
+    } finally {
+      bitmap.close();
+    }
+  }
+
+  if (filter === "FlateDecode") {
+    const bits = Number(dict.match(/\/BitsPerComponent\s+(\d+)/)?.[1] || 8);
+    if (bits !== 8) return null;
+
+    let raw = await inflateZlib(data);
+    let comps = pdfColorComponents(dict, latin);
+    const predictor = Number(dict.match(/\/Predictor\s+(\d+)/)?.[1] || 1);
+    if (predictor >= 10) {
+      const columns = Number(dict.match(/\/Columns\s+(\d+)/)?.[1] || width);
+      const colors = Number(dict.match(/\/Colors\s+(\d+)/)?.[1] || comps || 3);
+      raw = undoPngPredictors(raw, columns, colors);
+      if (!comps) comps = colors;
+    }
+    if (!comps) comps = Math.round(raw.length / (width * height));
+    if ((comps !== 1 && comps !== 3) || raw.length < width * height * comps) return null;
+
+    const rgba = new Uint8ClampedArray(width * height * 4);
+    for (let i = 0, j = 0; i < width * height; i++, j += 4) {
+      if (comps === 1) {
+        rgba[j] = rgba[j + 1] = rgba[j + 2] = raw[i];
+      } else {
+        rgba[j] = raw[i * 3];
+        rgba[j + 1] = raw[i * 3 + 1];
+        rgba[j + 2] = raw[i * 3 + 2];
+      }
+      rgba[j + 3] = 255;
+    }
+    return bitmapSourceToJpegUrls(new ImageData(rgba, width, height), width, height);
+  }
+
+  return null;
+}
+
+function pdfStreamEnd(latin, dict, dataStart) {
+  const indirect = dict.match(/\/Length\s+(\d+)\s+\d+\s+R/);
+  if (indirect) {
+    const body = findPdfObjectBody(latin, Number(indirect[1]));
+    const n = body.match(/\d+/);
+    if (n) return dataStart + Number(n[0]);
+  } else {
+    const direct = dict.match(/\/Length\s+(\d+)/);
+    if (direct) return dataStart + Number(direct[1]);
+  }
+  const end = latin.indexOf("endstream", dataStart);
+  return end < 0 ? -1 : end;
+}
+
+function findPdfObjectBody(latin, num) {
+  const match = new RegExp(`(?:^|[^\\d])${num}\\s+0\\s+obj`).exec(latin);
+  if (!match) return "";
+  const start = match.index + match[0].length;
+  const end = latin.indexOf("endobj", start);
+  return end < 0 ? "" : latin.slice(start, end);
+}
+
+// Число цветовых компонент картинки: прямое имя, либо ссылка на объект
+// ColorSpace (ICCBased — через второй переход, /N в словаре ICC-потока).
+function pdfColorComponents(dict, latin) {
+  const named = (name) =>
+    ({ DeviceGray: 1, CalGray: 1, DeviceRGB: 3, CalRGB: 3, DeviceCMYK: 4 }[name] || 0);
+
+  const direct = dict.match(/\/ColorSpace\s*\/(\w+)/);
+  if (direct) return named(direct[1]);
+
+  const ref = dict.match(/\/ColorSpace\s+(\d+)\s+\d+\s+R/);
+  if (!ref) return 0;
+  let body = findPdfObjectBody(latin, Number(ref[1]));
+  if (!body) return 0;
+  if (/\/Indexed/.test(body)) return 0;
+
+  const icc = body.match(/\/ICCBased\s+(\d+)\s+\d+\s+R/);
+  if (icc) body = findPdfObjectBody(latin, Number(icc[1])) || body;
+
+  const n = body.match(/\/N\s+(\d+)/);
+  if (n) return Number(n[1]);
+  const name = body.match(/\/(DeviceGray|CalGray|DeviceRGB|CalRGB|DeviceCMYK)/);
+  return name ? named(name[1]) : 0;
+}
+
+// Обратные PNG-предикторы (Predictor >= 10): каждая строка начинается с байта
+// типа фильтра (0 none, 1 sub, 2 up, 3 average, 4 paeth).
+function undoPngPredictors(data, columns, colors) {
+  const bpp = colors;
+  const rowLen = columns * colors;
+  const rows = Math.floor(data.length / (rowLen + 1));
+  const out = new Uint8Array(rows * rowLen);
+  let prev = new Uint8Array(rowLen);
+
+  for (let r = 0; r < rows; r++) {
+    const type = data[r * (rowLen + 1)];
+    const src = data.subarray(r * (rowLen + 1) + 1, (r + 1) * (rowLen + 1));
+    const dst = out.subarray(r * rowLen, (r + 1) * rowLen);
+
+    for (let i = 0; i < rowLen; i++) {
+      const left = i >= bpp ? dst[i - bpp] : 0;
+      const up = prev[i];
+      const upLeft = i >= bpp ? prev[i - bpp] : 0;
+      let v = src[i];
+      if (type === 1) v += left;
+      else if (type === 2) v += up;
+      else if (type === 3) v += (left + up) >> 1;
+      else if (type === 4) {
+        const p = left + up - upLeft;
+        const pa = Math.abs(p - left);
+        const pb = Math.abs(p - up);
+        const pc = Math.abs(p - upLeft);
+        v += pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
+      }
+      dst[i] = v & 0xff;
+    }
+    prev = dst;
+  }
+  return out;
+}
+
+// PDF FlateDecode — это zlib-формат ("deflate", с заголовком), в отличие от
+// deflate-raw внутри ZIP. Чтение начинается до записи — см. inflateRaw.
+async function inflateZlib(bytes) {
+  if (typeof DecompressionStream !== "function") {
+    throw new Error("браузер не поддерживает распаковку Flate");
+  }
+  const stream = new DecompressionStream("deflate");
+  const output = new Response(stream.readable).arrayBuffer();
+  const writer = stream.writable.getWriter();
+  writer.write(bytes).catch(() => {});
+  writer.close().catch(() => {});
+  return new Uint8Array(await output);
+}
+
+// Из готовой картинки (ImageData или ImageBitmap) — JPEG data:-URL всей
+// страницы + увеличенного верха (45% высоты), где обычно реквизиты и БИН.
+async function bitmapSourceToJpegUrls(source, width, height) {
+  const full = new OffscreenCanvas(width, height);
+  const ctx = full.getContext("2d");
+  if (typeof ImageData !== "undefined" && source instanceof ImageData) {
+    ctx.putImageData(source, 0, 0);
+  } else {
+    ctx.drawImage(source, 0, 0);
+  }
+
+  const cropHeight = Math.max(1, Math.round(height * 0.45));
+  const crop = new OffscreenCanvas(width, cropHeight);
+  crop.getContext("2d").drawImage(full, 0, 0, width, cropHeight, 0, 0, width, cropHeight);
+
+  return [
+    await canvasToScaledJpegUrl(full, width, height),
+    await canvasToScaledJpegUrl(crop, width, cropHeight),
+  ];
+}
+
+async function canvasToScaledJpegUrl(canvas, width, height) {
+  let target = canvas;
+  const k = Math.min(MAX_JPEG_DIMENSION / width, MAX_JPEG_DIMENSION / height, 1);
+  if (k < 1) {
+    target = new OffscreenCanvas(Math.max(1, Math.round(width * k)), Math.max(1, Math.round(height * k)));
+    target.getContext("2d").drawImage(canvas, 0, 0, target.width, target.height);
+  }
+  const blob = await target.convertToBlob({ type: "image/jpeg", quality: 0.85 });
+  return `data:image/jpeg;base64,${bytesToBase64(new Uint8Array(await blob.arrayBuffer()))}`;
+}
+
+// Поиск JPEG по сырым байтам PDF даёт ложные срабатывания внутри сжатых потоков
+// (кусок Flate-данных случайно начинается с FF D8 FF). Такой «мусор» OpenAI и
+// OpenRouter отвергают ошибкой unsupported image, поэтому каждый срез проверяем
+// декодированием перед отправкой.
+async function filterDecodableImages(dataUrls) {
+  const valid = [];
+  for (const url of dataUrls) {
+    try {
+      const bitmap = await createImageBitmap(await (await fetch(url)).blob());
+      bitmap.close();
+      valid.push(url);
+    } catch {
+      // не настоящая картинка — пропускаем
+    }
+  }
+  return valid;
 }
 
 function extractEmbeddedImagesFromPdf(bytes) {
@@ -1155,14 +1454,16 @@ async function extractSupplierXinFromPdfVision(attachment, cfg, report) {
 
   if (!images.length) {
     report?.("извлекаю фото из PDF");
-    images = extractEmbeddedImagesFromPdf(attachment.bytes);
+    images = await filterDecodableImages(extractEmbeddedImagesFromPdf(attachment.bytes));
   }
 
   if (!images.length) {
     return {
       xin: "",
       confidence: "low",
-      note: renderError || "не удалось получить изображение из PDF (проверьте lib/pdf.js в расширении)",
+      note: renderError
+        ? `рендер PDF не удался (${renderError}), пригодных изображений в PDF не найдено`
+        : "не удалось получить изображение из PDF",
     };
   }
 
@@ -1184,7 +1485,7 @@ async function extractSupplierXinFromRenderedImages(imageUrls, cfg, report) {
   );
   const content = [{ type: "text", text: prompt }];
   for (const url of imageUrls) {
-    content.push({ type: "image_url", image_url: { url } });
+    content.push({ type: "image_url", image_url: { url, detail: "high" } });
   }
 
   return tryModelsForXin(models, cfg, async (model) => {
@@ -1215,16 +1516,29 @@ async function tryModelsForXin(models, cfg, callModel) {
       const raw = await callModel(model);
       const parsed = parseXinJson(raw);
       if (parsed) {
-        let xin = onlyDigits(parsed.xin);
-        if (xin.length !== 12) xin = "";
-        if (xin && cfg.ownXin && xin === cfg.ownXin) xin = "";
-        if (xin && !isValidXinChecksum(xin)) {
-          // Контрольная цифра не сошлась — модель ошиблась при чтении
-          // (типично для сканов). Пробуем следующую модель цепочки.
-          errors.push(`${shortModelName(model)}: БИН ${xin} не прошёл контрольную сумму (ошибка распознавания скана)`);
+        // Модель возвращает основное прочтение плюс прочтения из каждого места
+        // документа: берём первое, которое проходит контрольную сумму — на
+        // сканах модель обычно читает верно хотя бы в одном месте.
+        const rejected = [];
+        const candidates = [parsed.xin, ...(Array.isArray(parsed.candidates) ? parsed.candidates : [])];
+        for (const candidate of candidates) {
+          const xin = onlyDigits(candidate);
+          if (xin.length !== 12) continue;
+          if (cfg.ownXin && xin === cfg.ownXin) continue;
+          if (!isValidXinChecksum(xin)) {
+            rejected.push(xin);
+            continue;
+          }
+          return { xin, confidence: parsed.confidence || "medium" };
+        }
+        if (rejected.length) {
+          // Все прочтения с битой контрольной цифрой — ошибка распознавания
+          // скана. Пробуем следующую модель цепочки.
+          errors.push(
+            `${shortModelName(model)}: БИН ${dedupe(rejected).join(", ")} не прошёл контрольную сумму (ошибка распознавания скана)`
+          );
           continue;
         }
-        if (xin) return { xin, confidence: parsed.confidence || "medium" };
       }
       errors.push(`${shortModelName(model)}: пустой/невалидный БИН`);
     } catch (err) {
@@ -1254,7 +1568,10 @@ function buildXinPrompt(sourceText, cfg) {
     `Перепроверь каждую цифру: номер поставщика часто встречается в документе ` +
     `несколько раз (реквизиты, блок «Поставщик», печать) — сверь эти вхождения между собой.\n` +
     `Ответь СТРОГО одним JSON-объектом без markdown и пояснений: ` +
-    `{"xin":"12 цифр или null","confidence":"high|medium|low"}.\n\n` +
+    `{"xin":"12 цифр или null","candidates":["..."],"confidence":"high|medium|low"}.\n` +
+    `В candidates перечисли прочтение цифр номера поставщика из КАЖДОГО места документа, ` +
+    `где он встречается (реквизиты, блок «Поставщик», печать), по одной записи на место — ` +
+    `даже если прочтения совпадают. Читай цифры с картинки, не «исправляй» их по памяти.\n\n` +
     sourceText
   );
 }
@@ -1281,27 +1598,38 @@ async function callChatMessages(model, messages, cfg, plugins) {
 }
 
 async function callOpenAIMessages(model, messages, cfg) {
-  const res = await fetch(OPENAI_API, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${cfg.openaiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0,
-      max_tokens: 100,
-      messages,
-    }),
-  });
-  if (!res.ok) {
-    const body = await safeText(res);
-    throw new Error(`OpenAI ${model}: HTTP ${res.status} ${body.slice(0, 200)}`);
+  // Reasoning-модели OpenAI (o-серия, gpt-5) не принимают max_tokens и
+  // temperature — при таком 400-м пересобираем параметры и повторяем запрос.
+  const body = { model, temperature: 0, max_tokens: 100, messages };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(OPENAI_API, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${cfg.openaiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content || !content.trim()) throw new Error(`OpenAI ${model}: пустой ответ`);
+      return content;
+    }
+    const errText = await safeText(res);
+    if (res.status === 400 && "max_tokens" in body && errText.includes("max_tokens")) {
+      delete body.max_tokens;
+      // У reasoning-моделей сюда входят и «мысли», поэтому лимит с запасом.
+      body.max_completion_tokens = 2000;
+      continue;
+    }
+    if (res.status === 400 && "temperature" in body && errText.includes("temperature")) {
+      delete body.temperature;
+      continue;
+    }
+    throw new Error(`OpenAI ${model}: HTTP ${res.status} ${errText.slice(0, 200)}`);
   }
-  const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content || !content.trim()) throw new Error(`OpenAI ${model}: пустой ответ`);
-  return content;
+  throw new Error(`OpenAI ${model}: не удалось подобрать параметры запроса`);
 }
 
 async function callOpenRouterMessages(model, messages, cfg, plugins) {
