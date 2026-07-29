@@ -266,8 +266,20 @@ async function processPage(page, cfg, report) {
         if (banned.length) cfgRound.bannedXins = banned;
         if (round === 2 && banned.length) cfgRound.verifyVariants = generateXinVariants(banned, cfg);
 
-        const { xin, confidence, note } = await extractSupplierXinFromAttachment(attachment, cfgRound, report);
+        const result = await extractSupplierXinFromAttachment(attachment, cfgRound, report);
+        const { xin, confidence, note } = result;
         if (!xin) {
+          // Перечитка вернула ровно те же числа, что КГД уже отверг, и ни
+          // одного нового прочтения: номер прочитан верно, просто КГД его не
+          // знает (самозанятые и физлица в реестре контрагентов отсутствуют).
+          // Подбирать «варианты» в этом случае нельзя — соседнее число может
+          // оказаться чужим реальным ИИН, и мы запишем чужой налоговый режим.
+          if (result.repeatedOnly && result.repeatedXins?.length) {
+            return errorResult(
+              `Ошибка: КГД не вернул данные по БИН/ИИН ${result.repeatedXins.join(", ")} — номер перечитан повторно и совпадает с документом. ` +
+                `Вероятно, контрагент отсутствует в реестре КГД (самозанятый или физлицо) либо сервис временно недоступен`
+            );
+          }
           lastProblem = note
             ? `БИН поставщика не найден (${attachment.name}): ${note}`
             : `БИН поставщика не найден (${attachment.name})`;
@@ -284,13 +296,25 @@ async function processPage(page, cfg, report) {
             report?.(`КГД не знает БИН ${xin} — перечитываю документ`);
             continue;
           }
+          if (kgd.suspectWrongXin && banned.length) {
+            // История перечиток: если одно из этих чисел совпадает с документом,
+            // дело не в распознавании — контрагента просто нет в реестре.
+            return errorResult(
+              `${kgd.error}. Ранее КГД также отверг прочтения: ${banned.join(", ")} — если какое-то из них совпадает с документом, контрагента нет в реестре КГД (самозанятый/физлицо)`
+            );
+          }
           return errorResult(kgd.error);
         }
 
         const confidenceNote = confidence && confidence !== "high" ? ` (уверенность: ${confidence})` : "";
+        // Номер из раунда вариантов-подсказок не прочитан напрямую, а подобран —
+        // честно помечаем результат для ручной сверки с документом.
+        const variantNote = round === 2 && cfgRound.verifyVariants?.includes(xin)
+          ? " (номер подобран по контрольной сумме — сверьте с документом)"
+          : "";
         return {
-          taxMode: `${kgd.taxMode}${confidenceNote}`,
-          vatStatus: `${kgd.vatStatus}${confidenceNote}`,
+          taxMode: `${kgd.taxMode}${confidenceNote}${variantNote}`,
+          vatStatus: `${kgd.vatStatus}${confidenceNote}${variantNote}`,
         };
       }
     } catch (err) {
@@ -608,6 +632,10 @@ async function extractSupplierXinFromAttachment(attachment, cfg, report) {
     report?.("ищу БИН в тексте (AI)");
     const result = await extractSupplierXin(text, cfg);
     if (result.xin) return result;
+    // Текст был, но БИН в нём не нашёлся — сохраняем детали для примечания.
+    localError = result.note
+      ? `БИН не найден в тексте файла: ${result.note}`
+      : "БИН не найден в тексте файла";
   }
 
   if (canUseVisionFallback(kind, attachment)) {
@@ -789,6 +817,15 @@ async function renderPdfToImages(bytes) {
 }
 
 async function extractSpreadsheetText(attachment) {
+  // Реальный формат важнее расширения: встречаются xlsx, переименованные
+  // в .xls (ZIP-сигнатура), и старые бинарные xls под именем .xlsx.
+  if (looksLikeZip(attachment.bytes)) {
+    return extractXlsxText(attachment.bytes);
+  }
+  if (looksLikeOle2(attachment.bytes)) {
+    return extractReadableBinaryStrings(attachment.bytes);
+  }
+
   if (["csv", "tsv"].includes(attachment.ext) || attachment.contentType === "text/csv") {
     return normalizeDelimitedText(decodeTextBytes(attachment.bytes), attachment.ext === "tsv" ? "\t" : ",");
   }
@@ -802,6 +839,24 @@ async function extractSpreadsheetText(attachment) {
   }
 
   throw new Error(`неподдерживаемый формат таблицы .${attachment.ext || "unknown"}`);
+}
+
+function looksLikeZip(bytes) {
+  return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+}
+
+function looksLikeOle2(bytes) {
+  return (
+    bytes.length >= 8 &&
+    bytes[0] === 0xd0 &&
+    bytes[1] === 0xcf &&
+    bytes[2] === 0x11 &&
+    bytes[3] === 0xe0 &&
+    bytes[4] === 0xa1 &&
+    bytes[5] === 0xb1 &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0xe1
+  );
 }
 
 function normalizeDelimitedText(text, delimiter) {
@@ -841,7 +896,29 @@ async function extractXlsxText(bytes) {
     if (chunks.join("\n\n").length >= MAX_TEXT_CHARS) break;
   }
 
+  // Некоторые счета целиком нарисованы текстовыми блоками поверх листа
+  // (DrawingML) — сам лист при этом почти пустой. Забираем и их текст.
+  const drawingPaths = Object.keys(entries)
+    .filter((name) => /^xl\/drawings\/drawing\d+\.xml$/i.test(name))
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  for (const path of drawingPaths) {
+    if (chunks.join("\n\n").length >= MAX_TEXT_CHARS) break;
+    const drawingText = extractDrawingText(entries[path]);
+    if (drawingText) chunks.push(`Надписи листа:\n${drawingText}`);
+  }
+
   return chunks.join("\n\n").slice(0, MAX_TEXT_CHARS);
+}
+
+// Текст из DrawingML: строка на каждый абзац <a:p>, прогоны <a:t> склеиваются.
+function extractDrawingText(xml) {
+  const lines = [];
+  for (const para of String(xml || "").matchAll(/<a:p\b[\s\S]*?<\/a:p>/g)) {
+    const runs = [...para[0].matchAll(/<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g)].map((m) => decodeXml(m[1]));
+    const line = runs.join("").replace(/\s+/g, " ").trim();
+    if (line) lines.push(line);
+  }
+  return lines.join("\n").slice(0, MAX_TEXT_CHARS);
 }
 
 async function readZipTextEntries(bytes, wantedNames = null) {
@@ -927,9 +1004,11 @@ async function inflateRaw(bytes) {
 }
 
 function parseSharedStrings(xml) {
+  // Самозакрытые <si/> обязаны давать пустую строку, а не пропуск: иначе
+  // индексы всех последующих строк сдвигаются и ячейки читают чужой текст.
   const strings = [];
-  for (const match of xml.matchAll(/<si\b[\s\S]*?<\/si>/g)) {
-    strings.push(extractXmlText(match[0]));
+  for (const match of xml.matchAll(/<si\b[^>]*\/>|<si\b[\s\S]*?<\/si>/g)) {
+    strings.push(match[0].includes("</si>") ? extractXmlText(match[0]) : "");
   }
   return strings;
 }
@@ -963,10 +1042,16 @@ function normalizeWorkbookTarget(target) {
 }
 
 function parseWorksheetText(xml, sharedStrings) {
+  // ВАЖНО: самозакрытые пустые ячейки (<c r="A1" s="1"/>) и строки (<row/>)
+  // нужно матчить отдельной ветвью. Иначе ленивое [\s\S]*? заглатывает всё от
+  // самозакрытого тега до закрытия следующего настоящего, атрибуты (включая
+  // t="s") берутся от пустой ячейки — и вместо текста выводится индекс.
   const rows = [];
-  for (const rowMatch of xml.matchAll(/<row\b[\s\S]*?<\/row>/g)) {
+  for (const rowMatch of xml.matchAll(/<row\b[^>]*\/>|<row\b[\s\S]*?<\/row>/g)) {
+    if (!rowMatch[0].includes("</row>")) continue;
     const cells = [];
-    for (const cellMatch of rowMatch[0].matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/g)) {
+    for (const cellMatch of rowMatch[0].matchAll(/<c\b[^>]*\/>|<c\b([^>]*)>([\s\S]*?)<\/c>/g)) {
+      if (cellMatch[1] === undefined) continue; // самозакрытая пустая ячейка
       const attrs = parseXmlAttributes(cellMatch[1]);
       const body = cellMatch[2];
       let value = "";
@@ -1001,7 +1086,9 @@ function parseXmlAttributes(source) {
 
 function extractXmlText(xml) {
   const parts = [];
-  for (const match of String(xml || "").matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)) {
+  // Теги текста бывают с префиксом пространства имён: <t> (xlsx), <w:t> (docx),
+  // <a:t> (DrawingML — надписи поверх листа).
+  for (const match of String(xml || "").matchAll(/<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/g)) {
     parts.push(decodeXml(match[1]));
   }
   if (parts.length) return parts.join(" ").replace(/\s+/g, " ").trim();
@@ -1046,18 +1133,22 @@ function extractReadableBinaryStrings(bytes) {
   }
   if (ascii.length >= 4) asciiParts.push(ascii);
 
+  // UTF-16-строки в BIFF лежат с произвольным выравниванием — сканируем
+  // и с чётного, и с нечётного смещения, иначе половина строк теряется.
   const utf16Parts = [];
-  let utf16 = "";
-  for (let i = 0; i + 1 < bytes.length; i += 2) {
-    const code = bytes[i] | (bytes[i + 1] << 8);
-    if (isPrintableCodePoint(code)) {
-      utf16 += String.fromCharCode(code);
-    } else {
-      if (utf16.length >= 4) utf16Parts.push(utf16);
-      utf16 = "";
+  for (const offset of [0, 1]) {
+    let utf16 = "";
+    for (let i = offset; i + 1 < bytes.length; i += 2) {
+      const code = bytes[i] | (bytes[i + 1] << 8);
+      if (isPrintableCodePoint(code)) {
+        utf16 += String.fromCharCode(code);
+      } else {
+        if (utf16.length >= 4) utf16Parts.push(utf16);
+        utf16 = "";
+      }
     }
+    if (utf16.length >= 4) utf16Parts.push(utf16);
   }
-  if (utf16.length >= 4) utf16Parts.push(utf16);
 
   return dedupe([...utf16Parts, ...asciiParts])
     .join("\n")
@@ -1628,6 +1719,11 @@ async function tryModelsForXin(models, cfg, callModel) {
   // Собираем ошибку каждой модели, чтобы в Notion было видно, что именно
   // произошло по всей цепочке, а не только у последней модели.
   const errors = [];
+  // Если модели при перечитке возвращают ТОЛЬКО уже отвергнутые КГД числа и ни
+  // одного нового прочтения — номер в документе прочитан верно, просто КГД его
+  // не знает (например, самозанятый). Это сигнал прекратить перечитки.
+  const bannedSeen = new Set();
+  let freshSeen = false;
   for (const model of models) {
     throwIfCancelled(cfg.run);
     try {
@@ -1647,8 +1743,10 @@ async function tryModelsForXin(models, cfg, callModel) {
           if (cfg.ownXin && xin === cfg.ownXin) continue;
           if (bannedSet.has(xin)) {
             bannedReturned.push(xin);
+            bannedSeen.add(xin);
             continue;
           }
+          freshSeen = true;
           if (!isValidXinChecksum(xin)) {
             rejected.push(xin);
             continue;
@@ -1681,7 +1779,13 @@ async function tryModelsForXin(models, cfg, callModel) {
       errors.push(`${shortModelName(model)}: ${msg.slice(0, 160)}`);
     }
   }
-  return { xin: "", confidence: "low", note: errors.join("; ") };
+  return {
+    xin: "",
+    confidence: "low",
+    note: errors.join("; "),
+    repeatedOnly: bannedSeen.size > 0 && !freshSeen,
+    repeatedXins: [...bannedSeen],
+  };
 }
 
 function buildXinPrompt(sourceText, cfg) {
