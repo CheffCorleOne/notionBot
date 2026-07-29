@@ -59,6 +59,20 @@ let creatingOffscreenDocument = null;
 let pdfRequestCounter = 0;
 let keepAliveTimer = null;
 
+// Текущий запуск проверки: { cancelled, controller }. Кнопка «Остановить»
+// ставит cancelled и обрывает летящие запросы к AI/КГД через AbortController.
+// Записи в Notion не прерываются: строка либо дописывается целиком, либо
+// (если остановили посреди обработки) не трогается вовсе.
+let activeRun = null;
+
+function throwIfCancelled(run) {
+  if (run?.cancelled) {
+    const err = new Error("Проверка остановлена");
+    err.cancelled = true;
+    throw err;
+  }
+}
+
 function startKeepAlive() {
   stopKeepAlive();
   keepAliveTimer = setInterval(() => {
@@ -77,6 +91,13 @@ function stopKeepAlive() {
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "START_CHECK") {
+    if (activeRun) {
+      sendResponse({ ok: true, started: false, alreadyRunning: true });
+      return false;
+    }
+
+    const run = { cancelled: false, controller: new AbortController() };
+    activeRun = run;
     (async () => {
       let tabId;
       try {
@@ -86,14 +107,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         startKeepAlive();
         progress(tabId, { stage: "start", text: "Запуск..." });
-        await runBatch(tabId);
+        await runBatch(tabId, run);
       } catch (err) {
-        progress(tabId, { stage: "error", text: `Ошибка: ${String(err?.message || err)}` });
+        if (run.cancelled) {
+          progress(tabId, { stage: "cancelled", text: "Проверка остановлена." });
+        } else {
+          progress(tabId, { stage: "error", text: `Ошибка: ${String(err?.message || err)}` });
+        }
       } finally {
         stopKeepAlive();
+        activeRun = null;
       }
     })();
     sendResponse({ ok: true, started: true });
+    return false;
+  }
+
+  if (msg?.type === "CANCEL_CHECK") {
+    const run = activeRun;
+    if (run) {
+      run.cancelled = true;
+      run.controller.abort();
+    }
+    sendResponse({ ok: true, cancelling: Boolean(run) });
     return false;
   }
 });
@@ -134,8 +170,9 @@ function visionModels(cfg) {
 // ---------------------------------------------------------------------------
 // Основной сценарий: пройти по всем необработанным строкам базы.
 // ---------------------------------------------------------------------------
-async function runBatch(tabId) {
+async function runBatch(tabId, run) {
   const cfg = await loadConfig();
+  cfg.run = run;
 
   progress(tabId, { stage: "start", text: "Подготовка..." });
 
@@ -163,6 +200,8 @@ async function runBatch(tabId) {
   let errors = 0;
 
   for (let i = 0; i < total; i++) {
+    if (run?.cancelled) break;
+
     const page = pages[i];
     const rowLabel = `Обрабатываю ${i + 1}/${total}`;
     progress(tabId, { stage: "processing", current: i + 1, total, text: `${rowLabel}...` });
@@ -171,6 +210,9 @@ async function runBatch(tabId) {
     try {
       result = await processPage(page, cfg, makeReporter(tabId, rowLabel));
     } catch (err) {
+      // Остановка посреди строки: ничего не записываем, колонки остались
+      // пустыми — следующий запуск подхватит строку заново.
+      if (run?.cancelled || err?.cancelled) break;
       const error = `Ошибка: ${String(err?.message || err)}`;
       result = { taxMode: error, vatStatus: error };
       errors++;
@@ -185,10 +227,15 @@ async function runBatch(tabId) {
     }
     done++;
 
+    if (run?.cancelled) break;
     await sleep(RATE_LIMIT_MS);
   }
 
-  progress(tabId, { stage: "done", text: `Готово: ${done}/${total}${errors ? `, ошибок: ${errors}` : ""}.` });
+  if (run?.cancelled) {
+    progress(tabId, { stage: "cancelled", text: `Остановлено: обработано ${done} из ${total}.` });
+  } else {
+    progress(tabId, { stage: "done", text: `Готово: ${done}/${total}${errors ? `, ошибок: ${errors}` : ""}.` });
+  }
   return { total, done, errors };
 }
 
@@ -203,8 +250,9 @@ async function processPage(page, cfg, report) {
   for (const file of files) {
     let attachment;
     try {
+      throwIfCancelled(cfg.run);
       report?.("скачиваю файл");
-      attachment = await downloadAttachment(file);
+      attachment = await downloadAttachment(file, cfg);
 
       // До трёх раундов чтения. КГД отвечает 500 в том числе на несуществующий
       // номер — а неверно прочитанная цифра изредка проходит и контрольную
@@ -213,6 +261,7 @@ async function processPage(page, cfg, report) {
       // варианты с одной исправленной цифрой, проходящие контрольную сумму.
       const banned = [];
       for (let round = 0; round < 3; round++) {
+        throwIfCancelled(cfg.run);
         const cfgRound = { ...cfg };
         if (banned.length) cfgRound.bannedXins = banned;
         if (round === 2 && banned.length) cfgRound.verifyVariants = generateXinVariants(banned, cfg);
@@ -245,6 +294,7 @@ async function processPage(page, cfg, report) {
         };
       }
     } catch (err) {
+      if (err?.cancelled || cfg.run?.cancelled) throw err;
       lastProblem = `${attachment?.name || file.name || "файл"}: ${String(err?.message || err)}`;
     }
   }
@@ -510,8 +560,8 @@ function richTextValue(text) {
 // Вложения → текст. PDF.js работает в offscreen-документе, потому что в MV3
 // service worker нельзя использовать fallback PDF.js через dynamic import().
 // ---------------------------------------------------------------------------
-async function downloadAttachment(file) {
-  const res = await fetch(file.url);
+async function downloadAttachment(file, cfg) {
+  const res = await fetch(file.url, { signal: cfg?.run?.controller?.signal });
   if (!res.ok) throw new Error(`не удалось скачать файл (${res.status})`);
 
   const contentType = normalizeContentType(res.headers.get("Content-Type"));
@@ -1579,6 +1629,7 @@ async function tryModelsForXin(models, cfg, callModel) {
   // произошло по всей цепочке, а не только у последней модели.
   const errors = [];
   for (const model of models) {
+    throwIfCancelled(cfg.run);
     try {
       const raw = await callModel(model);
       const parsed = parseXinJson(raw);
@@ -1620,6 +1671,8 @@ async function tryModelsForXin(models, cfg, callModel) {
       }
       errors.push(`${shortModelName(model)}: пустой/невалидный БИН`);
     } catch (err) {
+      // Оборванный отменой запрос — не ошибка модели, прерываем всю цепочку.
+      if (err?.cancelled || cfg.run?.cancelled) throwIfCancelled(cfg.run);
       const msg = String(err?.message || err);
       if (msg.includes("HTTP 402") && msg.includes("files")) {
         errors.push(`${shortModelName(model)}: для PDF-файлов нужен баланс`);
@@ -1704,6 +1757,7 @@ async function callOpenAIMessages(model, messages, cfg) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
+      signal: cfg.run?.controller?.signal,
     });
     if (res.ok) {
       const data = await res.json();
@@ -1742,6 +1796,7 @@ async function callOpenRouterMessages(model, messages, cfg, plugins) {
       messages,
       ...(plugins ? { plugins } : {}),
     }),
+    signal: cfg.run?.controller?.signal,
   });
   if (!res.ok) {
     const body = await safeText(res);
@@ -1783,8 +1838,10 @@ async function fetchCounterpartyData(xin, cfg) {
         method: "POST",
         headers: { "X-Portal-Token": cfg.portalToken, "Content-Type": "application/json" },
         body: JSON.stringify({ xin }),
+        signal: cfg.run?.controller?.signal,
       });
     } catch (err) {
+      throwIfCancelled(cfg.run);
       if (attempt < KGD_ATTEMPTS) {
         await sleep(1000 * attempt);
         continue;

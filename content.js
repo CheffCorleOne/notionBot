@@ -7,8 +7,12 @@
 
   const BTN_ID = "kgd-check-btn";
   const TOAST_ID = "kgd-check-toast";
+  const IDLE_LABEL = "Проверить контрагентов";
+  const STOP_LABEL = "Остановить проверку";
+  const STOPPING_LABEL = "Останавливаю...";
   let buttonHidden = false;
   let running = false;
+  let stopping = false;
   let lastProgressAt = 0;
 
   async function loadButtonHidden() {
@@ -27,9 +31,31 @@
     const btn = document.createElement("button");
     btn.id = BTN_ID;
     btn.type = "button";
-    btn.textContent = "Проверить контрагентов";
+    btn.textContent = IDLE_LABEL;
     btn.addEventListener("click", onClick);
     document.body.appendChild(btn);
+    syncButton();
+  }
+
+  // Кнопка отражает состояние проверки: запустить -> остановить -> останавливаю.
+  function syncButton() {
+    const btn = document.getElementById(BTN_ID);
+    if (!btn) return;
+    if (stopping) {
+      btn.textContent = STOPPING_LABEL;
+      btn.disabled = true;
+      btn.classList.add("kgd-busy");
+      btn.classList.remove("kgd-stop");
+    } else if (running) {
+      btn.textContent = STOP_LABEL;
+      btn.disabled = false;
+      btn.classList.remove("kgd-busy");
+      btn.classList.add("kgd-stop");
+    } else {
+      btn.textContent = IDLE_LABEL;
+      btn.disabled = false;
+      btn.classList.remove("kgd-busy", "kgd-stop");
+    }
   }
 
   function showToast(text, tone) {
@@ -51,16 +77,10 @@
     }, ms);
   }
 
-  function setBusy(busy) {
-    const btn = document.getElementById(BTN_ID);
-    if (!btn) return;
-    btn.disabled = busy;
-    btn.classList.toggle("kgd-busy", busy);
-  }
-
   function finishRun(tone) {
     running = false;
-    setBusy(false);
+    stopping = false;
+    syncButton();
     hideToastLater(8000);
     if (tone) {
       const toast = document.getElementById(TOAST_ID);
@@ -69,10 +89,24 @@
   }
 
   async function onClick() {
-    if (running) return;
+    if (stopping) return;
+    if (running) {
+      // Кнопка в режиме «Остановить проверку».
+      stopping = true;
+      syncButton();
+      showToast("Останавливаю проверку...", "info");
+      try {
+        await chrome.runtime.sendMessage({ type: "CANCEL_CHECK" });
+      } catch {
+        // service worker недоступен — считаем проверку завершённой
+        finishRun("err");
+      }
+      return;
+    }
+
     running = true;
     lastProgressAt = Date.now();
-    setBusy(true);
+    syncButton();
     showToast("Запускаю проверку...", "info");
 
     const heartbeat = setInterval(() => {
@@ -89,7 +123,9 @@
 
     try {
       const resp = await chrome.runtime.sendMessage({ type: "START_CHECK" });
-      if (!resp?.started) {
+      if (resp?.alreadyRunning) {
+        showToast("Проверка уже идёт (возможно, запущена в другой вкладке)", "info");
+      } else if (!resp?.started) {
         showToast(resp?.error || "Не удалось запустить проверку", "err");
         finishRun("err");
       }
@@ -104,9 +140,17 @@
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg?.type !== "PROGRESS") return;
     lastProgressAt = Date.now();
+
+    // Прогресс может прийти и когда кнопка «не в курсе» (страницу перезагрузили
+    // во время проверки) — синхронизируем её состояние.
+    if ((msg.stage === "start" || msg.stage === "processing") && !running) {
+      running = true;
+      syncButton();
+    }
+
     const tone = msg.stage === "done" ? "ok" : msg.stage === "error" ? "err" : "info";
     showToast(msg.text || "...", tone);
-    if (msg.stage === "done" || msg.stage === "error") {
+    if (msg.stage === "done" || msg.stage === "error" || msg.stage === "cancelled") {
       finishRun(tone);
     }
   });

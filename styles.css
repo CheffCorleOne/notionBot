@@ -32,6 +32,15 @@
   cursor: default;
 }
 
+/* Режим «Остановить проверку» */
+#kgd-check-btn.kgd-stop {
+  background: #dc2626;
+}
+
+#kgd-check-btn.kgd-stop:hover {
+  background: #b91c1c;
+}
+
 #kgd-check-toast {
   position: fixed;
   right: 24px;
