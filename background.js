@@ -205,23 +205,45 @@ async function processPage(page, cfg, report) {
     try {
       report?.("скачиваю файл");
       attachment = await downloadAttachment(file);
-      const { xin, confidence, note } = await extractSupplierXinFromAttachment(attachment, cfg, report);
-      if (!xin) {
-        lastProblem = note
-          ? `БИН поставщика не найден (${attachment.name}): ${note}`
-          : `БИН поставщика не найден (${attachment.name})`;
-        continue;
+
+      // До трёх раундов чтения. КГД отвечает 500 в том числе на несуществующий
+      // номер — а неверно прочитанная цифра изредка проходит и контрольную
+      // сумму. Поэтому 500 от КГД трактуем как «вероятно, неверное прочтение»:
+      // раунд 2 — перечитать, запретив отвергнутое число; раунд 3 — дать модели
+      // варианты с одной исправленной цифрой, проходящие контрольную сумму.
+      const banned = [];
+      for (let round = 0; round < 3; round++) {
+        const cfgRound = { ...cfg };
+        if (banned.length) cfgRound.bannedXins = banned;
+        if (round === 2 && banned.length) cfgRound.verifyVariants = generateXinVariants(banned, cfg);
+
+        const { xin, confidence, note } = await extractSupplierXinFromAttachment(attachment, cfgRound, report);
+        if (!xin) {
+          lastProblem = note
+            ? `БИН поставщика не найден (${attachment.name}): ${note}`
+            : `БИН поставщика не найден (${attachment.name})`;
+          // Перечитка провалилась, но есть ещё раунд с вариантами-подсказками.
+          if (round < 2 && banned.length) continue;
+          break;
+        }
+
+        report?.("запрос в КГД");
+        const kgd = await fetchCounterpartyData(xin, cfg);
+        if (kgd.error) {
+          if (kgd.suspectWrongXin && round < 2) {
+            banned.push(xin);
+            report?.(`КГД не знает БИН ${xin} — перечитываю документ`);
+            continue;
+          }
+          return errorResult(kgd.error);
+        }
+
+        const confidenceNote = confidence && confidence !== "high" ? ` (уверенность: ${confidence})` : "";
+        return {
+          taxMode: `${kgd.taxMode}${confidenceNote}`,
+          vatStatus: `${kgd.vatStatus}${confidenceNote}`,
+        };
       }
-
-      report?.("запрос в КГД");
-      const kgd = await fetchCounterpartyData(xin, cfg);
-      if (kgd.error) return errorResult(kgd.error);
-
-      const confidenceNote = confidence && confidence !== "high" ? ` (уверенность: ${confidence})` : "";
-      return {
-        taxMode: `${kgd.taxMode}${confidenceNote}`,
-        vatStatus: `${kgd.vatStatus}${confidenceNote}`,
-      };
     } catch (err) {
       lastProblem = `${attachment?.name || file.name || "файл"}: ${String(err?.message || err)}`;
     }
@@ -275,6 +297,26 @@ const onlyDigits = (s) => String(s || "").replace(/\D/g, "");
 // Проверка контрольного (12-го) разряда казахстанского БИН/ИИН.
 // Позволяет детерминированно отсеять номера, неверно распознанные моделью
 // со скана: при перепутанных цифрах контрольная сумма почти всегда не сходится.
+// Варианты «неверного» числа с одной исправленной цифрой, проходящие
+// контрольную сумму: модель обычно ошибается ровно в одной цифре, и правильный
+// номер почти всегда попадает в этот список (~11 вариантов на число).
+function generateXinVariants(bannedList, cfg) {
+  const banned = new Set(bannedList);
+  const variants = [];
+  for (const source of bannedList) {
+    for (let pos = 0; pos < 12; pos++) {
+      for (let digit = 0; digit <= 9 && variants.length < 20; digit++) {
+        const candidate = source.slice(0, pos) + digit + source.slice(pos + 1);
+        if (candidate === source || banned.has(candidate) || variants.includes(candidate)) continue;
+        if (cfg.ownXin && candidate === cfg.ownXin) continue;
+        if (!isValidXinChecksum(candidate)) continue;
+        variants.push(candidate);
+      }
+    }
+  }
+  return variants;
+}
+
 function isValidXinChecksum(xin) {
   if (!/^\d{12}$/.test(xin)) return false;
   const d = [...xin].map(Number);
@@ -1091,6 +1133,9 @@ async function extractSupplierXinViaVision(attachment, cfg, kind, report) {
         const result = await extractSupplierXinFromRenderedImages(scans, cfg, report);
         if (result.xin) return result;
         scanNote = result.note || "";
+      } else {
+        // Видно в примечании Notion: модель читала PDF целиком, без полос-зумов.
+        scanNote = "встроенный скан из PDF извлечь не удалось";
       }
     } catch (err) {
       scanNote = String(err?.message || err);
@@ -1145,30 +1190,24 @@ async function extractSupplierXinFromImage(attachment, cfg, report) {
     throw new Error(`изображение слишком большое (${Math.round(attachment.bytes.byteLength / 1024 / 1024)} МБ)`);
   }
 
-  const models = visionModels(cfg);
-  const prompt = buildXinPrompt(
-    "Ниже прикреплено изображение счёта, скана, фото или табличного документа. Прочитай его визуально.",
-    cfg
-  );
-  const imageUrl = `data:${attachment.contentType || mimeFromExtension(attachment.ext) || "image/jpeg"};base64,${bytesToBase64(attachment.bytes)}`;
+  // Большое фото/скан режем на полосы-зумы (см. bitmapSourceToJpegUrls) —
+  // заодно любой формат нормализуется в JPEG, который принимают все провайдеры.
+  let imageUrls;
+  try {
+    const bitmap = await createImageBitmap(new Blob([attachment.bytes]));
+    try {
+      imageUrls = await bitmapSourceToJpegUrls(bitmap, bitmap.width, bitmap.height);
+    } finally {
+      bitmap.close();
+    }
+  } catch {
+    // формат не декодируется локально (например, heic) — отправляем как есть
+    imageUrls = [
+      `data:${attachment.contentType || mimeFromExtension(attachment.ext) || "image/jpeg"};base64,${bytesToBase64(attachment.bytes)}`,
+    ];
+  }
 
-  return tryModelsForXin(models, cfg, async (model) => {
-    report?.(`vision: ${shortModelName(model)}`);
-    return callChatMessages(
-      model,
-      [
-        { role: "system", content: "Ты извлекаешь данные из счетов и отвечаешь только валидным JSON." },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            { type: "image_url", image_url: { url: imageUrl, detail: "high" } },
-          ],
-        },
-      ],
-      cfg
-    );
-  });
+  return extractSupplierXinFromRenderedImages(imageUrls, cfg, report);
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,7 +1224,7 @@ async function extractScanImagesFromPdf(bytes) {
   const re = /\/Subtype\s*\/Image/g;
   let match;
   let attempts = 0;
-  while (urls.length < 4 && attempts < 20 && (match = re.exec(latin))) {
+  while (urls.length < 8 && attempts < 20 && (match = re.exec(latin))) {
     attempts++;
     try {
       const pageUrls = await decodePdfImageObject(bytes, latin, match.index);
@@ -1194,7 +1233,7 @@ async function extractScanImagesFromPdf(bytes) {
       // объект не разобрался — пробуем следующий
     }
   }
-  return urls.slice(0, 4);
+  return urls.slice(0, 8);
 }
 
 async function decodePdfImageObject(bytes, latin, subtypeAt) {
@@ -1207,55 +1246,69 @@ async function decodePdfImageObject(bytes, latin, subtypeAt) {
   const height = Number(dict.match(/\/Height\s+(\d+)/)?.[1]);
   if (!width || !height || width * height < MIN_SCAN_PIXELS) return null;
 
-  const filter = dict.match(/\/Filter\s*\[?\s*\/(\w+)/)?.[1] || "";
+  const filters = pdfFilterList(dict);
   let dataStart = streamAt + 6;
   if (bytes[dataStart] === 0x0d) dataStart++;
   if (bytes[dataStart] === 0x0a) dataStart++;
   const dataEnd = pdfStreamEnd(latin, dict, dataStart);
   if (dataEnd <= dataStart || dataEnd > bytes.length) return null;
-  const data = bytes.slice(dataStart, dataEnd);
+  let data = bytes.slice(dataStart, dataEnd);
 
-  if (filter === "DCTDecode") {
-    const bitmap = await createImageBitmap(new Blob([data], { type: "image/jpeg" }));
-    try {
-      if (bitmap.width * bitmap.height < MIN_SCAN_PIXELS) return null;
-      return await bitmapSourceToJpegUrls(bitmap, bitmap.width, bitmap.height);
-    } finally {
-      bitmap.close();
+  // Фильтры применяются по порядку. JPEG (DCTDecode) может быть дополнительно
+  // завёрнут в FlateDecode — сканеры пишут /Filter [/FlateDecode /DCTDecode]:
+  // снимаем обёртки, пока не дойдём до JPEG или до сырого битмапа.
+  for (const filter of filters) {
+    if (filter === "FlateDecode") {
+      data = await inflateZlib(data);
+      continue;
     }
-  }
-
-  if (filter === "FlateDecode") {
-    const bits = Number(dict.match(/\/BitsPerComponent\s+(\d+)/)?.[1] || 8);
-    if (bits !== 8) return null;
-
-    let raw = await inflateZlib(data);
-    let comps = pdfColorComponents(dict, latin);
-    const predictor = Number(dict.match(/\/Predictor\s+(\d+)/)?.[1] || 1);
-    if (predictor >= 10) {
-      const columns = Number(dict.match(/\/Columns\s+(\d+)/)?.[1] || width);
-      const colors = Number(dict.match(/\/Colors\s+(\d+)/)?.[1] || comps || 3);
-      raw = undoPngPredictors(raw, columns, colors);
-      if (!comps) comps = colors;
-    }
-    if (!comps) comps = Math.round(raw.length / (width * height));
-    if ((comps !== 1 && comps !== 3) || raw.length < width * height * comps) return null;
-
-    const rgba = new Uint8ClampedArray(width * height * 4);
-    for (let i = 0, j = 0; i < width * height; i++, j += 4) {
-      if (comps === 1) {
-        rgba[j] = rgba[j + 1] = rgba[j + 2] = raw[i];
-      } else {
-        rgba[j] = raw[i * 3];
-        rgba[j + 1] = raw[i * 3 + 1];
-        rgba[j + 2] = raw[i * 3 + 2];
+    if (filter === "DCTDecode") {
+      const bitmap = await createImageBitmap(new Blob([data], { type: "image/jpeg" }));
+      try {
+        if (bitmap.width * bitmap.height < MIN_SCAN_PIXELS) return null;
+        return await bitmapSourceToJpegUrls(bitmap, bitmap.width, bitmap.height);
+      } finally {
+        bitmap.close();
       }
-      rgba[j + 3] = 255;
     }
-    return bitmapSourceToJpegUrls(new ImageData(rgba, width, height), width, height);
+    return null; // CCITTFax/JBIG2/JPX и прочие не поддерживаем
   }
 
-  return null;
+  // Все фильтры сняты (или их не было) — data содержит сырой битмап.
+  const bits = Number(dict.match(/\/BitsPerComponent\s+(\d+)/)?.[1] || 8);
+  if (bits !== 8) return null;
+
+  let raw = data;
+  let comps = pdfColorComponents(dict, latin);
+  const predictor = Number(dict.match(/\/Predictor\s+(\d+)/)?.[1] || 1);
+  if (predictor >= 10) {
+    const columns = Number(dict.match(/\/Columns\s+(\d+)/)?.[1] || width);
+    const colors = Number(dict.match(/\/Colors\s+(\d+)/)?.[1] || comps || 3);
+    raw = undoPngPredictors(raw, columns, colors);
+    if (!comps) comps = colors;
+  }
+  if (!comps) comps = Math.round(raw.length / (width * height));
+  if ((comps !== 1 && comps !== 3) || raw.length < width * height * comps) return null;
+
+  const rgba = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0, j = 0; i < width * height; i++, j += 4) {
+    if (comps === 1) {
+      rgba[j] = rgba[j + 1] = rgba[j + 2] = raw[i];
+    } else {
+      rgba[j] = raw[i * 3];
+      rgba[j + 1] = raw[i * 3 + 1];
+      rgba[j + 2] = raw[i * 3 + 2];
+    }
+    rgba[j + 3] = 255;
+  }
+  return bitmapSourceToJpegUrls(new ImageData(rgba, width, height), width, height);
+}
+
+function pdfFilterList(dict) {
+  const array = dict.match(/\/Filter\s*\[([^\]]*)\]/);
+  if (array) return [...array[1].matchAll(/\/(\w+)/g)].map((m) => m[1]);
+  const single = dict.match(/\/Filter\s*\/(\w+)/);
+  return single ? [single[1]] : [];
 }
 
 function pdfStreamEnd(latin, dict, dataStart) {
@@ -1355,7 +1408,11 @@ async function inflateZlib(bytes) {
 }
 
 // Из готовой картинки (ImageData или ImageBitmap) — JPEG data:-URL всей
-// страницы + увеличенного верха (45% высоты), где обычно реквизиты и БИН.
+// страницы + горизонтальных полос-зумов. Vision-модели ужимают вход (вписывание
+// в 2048 px и короткая сторона до 768 px), из-за чего цифры на целой странице
+// «плывут». Полосы подобраны такой высоты, чтобы после этого ужатия остаться
+// практически в исходном разрешении — это и есть зум: цифры БИН на полосе
+// в 2–3 раза крупнее, чем на целой странице.
 async function bitmapSourceToJpegUrls(source, width, height) {
   const full = new OffscreenCanvas(width, height);
   const ctx = full.getContext("2d");
@@ -1365,14 +1422,23 @@ async function bitmapSourceToJpegUrls(source, width, height) {
     ctx.drawImage(source, 0, 0);
   }
 
-  const cropHeight = Math.max(1, Math.round(height * 0.45));
-  const crop = new OffscreenCanvas(width, cropHeight);
-  crop.getContext("2d").drawImage(full, 0, 0, width, cropHeight, 0, 0, width, cropHeight);
+  const urls = [await canvasToScaledJpegUrl(full, width, height)];
 
-  return [
-    await canvasToScaledJpegUrl(full, width, height),
-    await canvasToScaledJpegUrl(crop, width, cropHeight),
-  ];
+  // Небольшие картинки модель и так видит почти в исходном разрешении.
+  if (Math.min(width, height) <= 900) return urls;
+
+  const bandHeight = Math.max(400, Math.floor((768 * width) / 2048));
+  if (height > bandHeight * 1.2) {
+    const step = Math.floor(bandHeight * 0.85); // ~15% перекрытия, чтобы строка не порезалась
+    for (let y = 0; y < height && urls.length < 6; y += step) {
+      const h = Math.min(bandHeight, height - y);
+      if (y > 0 && h < bandHeight * 0.35) break; // хвост уже покрыт перекрытием
+      const band = new OffscreenCanvas(width, h);
+      band.getContext("2d").drawImage(full, 0, y, width, h, 0, 0, width, h);
+      urls.push(await canvasToScaledJpegUrl(band, width, h));
+    }
+  }
+  return urls;
 }
 
 async function canvasToScaledJpegUrl(canvas, width, height) {
@@ -1480,7 +1546,8 @@ async function extractSupplierXinFromPdfVision(attachment, cfg, report) {
 async function extractSupplierXinFromRenderedImages(imageUrls, cfg, report) {
   const models = visionModels(cfg);
   const prompt = buildXinPrompt(
-    "Ниже страницы PDF счёта (возможно скан или фото). Прочитай документ визуально.",
+    "Ниже изображения счёта (возможно скан или фото): страницы документа и их увеличенные фрагменты-полосы. " +
+      "Цифры точнее видны на увеличенных полосах — сверяй прочтения между картинками.",
     cfg
   );
   const content = [{ type: "text", text: prompt }];
@@ -1520,23 +1587,34 @@ async function tryModelsForXin(models, cfg, callModel) {
         // документа: берём первое, которое проходит контрольную сумму — на
         // сканах модель обычно читает верно хотя бы в одном месте.
         const rejected = [];
+        const bannedReturned = [];
+        const bannedSet = new Set(cfg.bannedXins || []);
         const candidates = [parsed.xin, ...(Array.isArray(parsed.candidates) ? parsed.candidates : [])];
         for (const candidate of candidates) {
           const xin = onlyDigits(candidate);
           if (xin.length !== 12) continue;
           if (cfg.ownXin && xin === cfg.ownXin) continue;
+          if (bannedSet.has(xin)) {
+            bannedReturned.push(xin);
+            continue;
+          }
           if (!isValidXinChecksum(xin)) {
             rejected.push(xin);
             continue;
           }
           return { xin, confidence: parsed.confidence || "medium" };
         }
-        if (rejected.length) {
-          // Все прочтения с битой контрольной цифрой — ошибка распознавания
-          // скана. Пробуем следующую модель цепочки.
-          errors.push(
-            `${shortModelName(model)}: БИН ${dedupe(rejected).join(", ")} не прошёл контрольную сумму (ошибка распознавания скана)`
-          );
+        if (rejected.length || bannedReturned.length) {
+          // Все прочтения либо с битой контрольной цифрой, либо уже отвергнуты
+          // КГД — ошибка распознавания скана. Пробуем следующую модель цепочки.
+          const parts = [];
+          if (rejected.length) {
+            parts.push(`БИН ${dedupe(rejected).join(", ")} не прошёл контрольную сумму (ошибка распознавания скана)`);
+          }
+          if (bannedReturned.length) {
+            parts.push(`модель снова вернула отвергнутый КГД БИН ${dedupe(bannedReturned).join(", ")}`);
+          }
+          errors.push(`${shortModelName(model)}: ${parts.join("; ")}`);
           continue;
         }
       }
@@ -1558,10 +1636,27 @@ function buildXinPrompt(sourceText, cfg) {
     ? `БИН/ИИН НАШЕЙ компании (покупателя) — ${cfg.ownXin}. Никогда не возвращай именно этот номер.`
     : `Если в счёте есть блок «Покупатель», его БИН/ИИН возвращать нельзя.`;
 
+  // Числа, которые КГД уже отверг (несуществующий БИН = неверное прочтение).
+  const bannedLine = cfg.bannedXins?.length
+    ? `ВАЖНО: числа ${cfg.bannedXins.join(", ")} — НЕВЕРНЫЕ прочтения этого документа ` +
+      `(таких БИН не существует). Не возвращай их. Перечитай цифры заново по одной, ` +
+      `особенно похожие по написанию: 0/6/8, 1/7, 3/8, 5/6, 2/7.\n`
+    : "";
+
+  // Варианты неверного прочтения с одной исправленной цифрой (см. generateXinVariants).
+  const variantsLine = cfg.verifyVariants?.length
+    ? `Подсказка: правильный номер, скорее всего, один из этих вариантов (каждый отличается ` +
+      `от неверного прочтения одной цифрой и проходит контрольную сумму БИН): ` +
+      `${cfg.verifyVariants.join(", ")}. Сравни каждый вариант с документом по цифрам и верни ` +
+      `тот, который действительно написан. Если ни один не совпадает — прочитай номер заново сам.\n`
+    : "";
+
   return (
     `Найди БИН или ИИН именно ПОСТАВЩИКА в счёте на оплату (Казахстан): ` +
     `(того, кто выставил счёт; обычно блок «Поставщик» / «Бенефициар»), а НЕ покупателя.\n` +
     `${excludeLine}\n` +
+    bannedLine +
+    variantsLine +
     `БИН/ИИН — это ровно 12 цифр. В документе цифры могут быть разделены пробелами ` +
     `или точками (например «721 027 300 595») — это тоже валидный БИН/ИИН, ` +
     `верни его как 12 цифр подряд без разделителей.\n` +
@@ -1708,6 +1803,8 @@ async function fetchCounterpartyData(xin, cfg) {
   if (res.status === 404) return { error: "Ошибка КГД 404: доступ к сервису запрещён" };
   if (res.status === 500)
     return {
+      // 500 приходит и на несуществующий БИН — сигнал перечитать документ.
+      suspectWrongXin: true,
       error: `Ошибка КГД 500: сбой на сервере ${sent}. Если номер не совпадает с документом — модель неверно распознала скан; если совпадает — сервис КГД не ответил, попробуйте позже`,
     };
   if (!res.ok) return { error: `Ошибка КГД ${res.status} ${sent}` };
